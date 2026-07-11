@@ -1,0 +1,14 @@
+[Unit]
+Description=TunnelGate Admin API
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/local/bin/tunnelgate api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
