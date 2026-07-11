@@ -5,7 +5,9 @@ import (
     "flag"
     "fmt"
     "os"
+    "os/exec"
     "os/signal"
+    "strconv"
     "syscall"
     "time"
 
@@ -53,21 +55,18 @@ func run() error {
     logger.Init(cfg.LogLevel, cfg.LogFormat)
     logger.Info("Starting TunnelGate", "domain", cfg.Domain)
 
-    // Initialize database
     db, err := user.InitDB(cfg.Database)
     if err != nil {
         return fmt.Errorf("database init: %w", err)
     }
     defer db.Close()
 
-    // Ensure certificate exists (if TLS ports)
     if len(cfg.Nginx.TLSPorts) > 0 {
         if err := cert.EnsureCertificate(cfg); err != nil {
             logger.Warn("Certificate setup failed", "error", err)
         }
     }
 
-    // Generate Nginx config
     if err := nginx.Configure(cfg); err != nil {
         logger.Warn("Nginx config generation failed", "error", err)
     }
@@ -77,28 +76,25 @@ func run() error {
 
     g, ctx := errgroup.WithContext(ctx)
 
-    // Proxy core
+    // Start proxy (will listen on all ports)
     g.Go(func() error {
         return runWithRecovery(ctx, "proxy", func() error {
             return proxy.Start(ctx, cfg)
         })
     })
 
-    // API server
     g.Go(func() error {
         return runWithRecovery(ctx, "api", func() error {
             return api.Start(ctx, cfg)
         })
     })
 
-    // Metrics server
     g.Go(func() error {
         return runWithRecovery(ctx, "metrics", func() error {
             return metrics.Start(ctx, cfg)
         })
     })
 
-    // Signal handling
     sigChan := make(chan os.Signal, 1)
     signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -107,10 +103,8 @@ func run() error {
         logger.Info("Received shutdown signal, stopping services...")
         cancel()
     case <-ctx.Done():
-        // context cancelled by error in one of the goroutines
     }
 
-    // Give services a chance to clean up
     shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
     defer shutdownCancel()
 
@@ -139,7 +133,9 @@ func runWithRecovery(ctx context.Context, name string, fn func() error) func() e
     }
 }
 
-// subcommand dispatcher (init, start, stop, status, user, cert, upgrade)
+// ---------------------------------------------------------------------
+// subcommands
+// ---------------------------------------------------------------------
 func runCommand(args []string) {
     if len(args) == 0 {
         return
@@ -147,28 +143,216 @@ func runCommand(args []string) {
     cmd := args[0]
     switch cmd {
     case "init":
-        // stub – would call interactive setup
-        fmt.Println("init command not yet implemented")
+        // interactive setup – stub (call external script)
+        fmt.Println("Run 'sudo ./install.sh' for interactive setup.")
     case "start":
         if err := run(); err != nil {
             logger.Error("Start failed", "error", err)
             os.Exit(1)
         }
     case "stop":
-        // stop systemd services
-        fmt.Println("stopping services...")
+        for _, svc := range []string{"proxy", "api"} {
+            exec.Command("systemctl", "stop", "tunnelgate-"+svc+".service").Run()
+        }
+        fmt.Println("Services stopped.")
     case "status":
-        fmt.Println("status command")
+        printStatus()
     case "user":
-        // user management
-        fmt.Println("user command")
+        userCommand(args[1:])
     case "cert":
-        // certificate renewal
-        fmt.Println("cert command")
+        certCommand(args[1:])
+    case "port":
+        portCommand(args[1:])
     case "upgrade":
-        fmt.Println("upgrade command")
+        fmt.Println("Upgrade not implemented yet.")
     default:
         fmt.Printf("Unknown command: %s\n", cmd)
         os.Exit(1)
+    }
+}
+
+func printStatus() {
+    cfg, err := config.Load(cfgPath)
+    if err != nil {
+        logger.Error("Load config", "error", err)
+        return
+    }
+    fmt.Printf("Domain:          %s\n", cfg.Domain)
+    fmt.Printf("HTTP ports:      %v\n", cfg.Nginx.HTTPPorts)
+    fmt.Printf("TLS ports:       %v\n", cfg.Nginx.TLSPorts)
+    fmt.Printf("Backend:         %s:%d\n", cfg.BackendHost, cfg.BackendPort)
+    db := user.OpenDB(cfg.Database)
+    count, _ := user.CountUsers(db)
+    fmt.Printf("Users:           %d\n", count)
+}
+
+// ---------------------------------------------------------------------
+// user subcommands
+// ---------------------------------------------------------------------
+func userCommand(args []string) {
+    if len(args) < 1 {
+        fmt.Println("Usage: tunnelgate user <add|list|extend|lock|delete> ...")
+        return
+    }
+    cfg, err := config.Load(cfgPath)
+    if err != nil {
+        logger.Error("Load config", "error", err)
+        return
+    }
+    db := user.OpenDB(cfg.Database)
+
+    sub := args[0]
+    switch sub {
+    case "add":
+        if len(args) < 2 {
+            fmt.Println("Usage: tunnelgate user add <username> [--days N] [--password P]")
+            return
+        }
+        username := args[1]
+        days := 30
+        password := ""
+        for i := 2; i < len(args); i++ {
+            if args[i] == "--days" && i+1 < len(args) {
+                days, _ = strconv.Atoi(args[i+1])
+                i++
+            }
+            if args[i] == "--password" && i+1 < len(args) {
+                password = args[i+1]
+                i++
+            }
+        }
+        u, err := user.AddUser(db, username, password, days)
+        if err != nil {
+            logger.Error("Add user failed", "error", err)
+            return
+        }
+        fmt.Printf("User %s added, expires %s\n", u.Username, u.Expiry)
+    case "list":
+        users, err := user.ListUsers(db)
+        if err != nil {
+            logger.Error("List users failed", "error", err)
+            return
+        }
+        fmt.Printf("%-20s %-15s %-6s\n", "Username", "Expiry", "Locked")
+        for _, u := range users {
+            fmt.Printf("%-20s %-15s %-6v\n", u.Username, u.Expiry.Format("2006-01-02"), u.Locked)
+        }
+    default:
+        fmt.Printf("Unknown user subcommand: %s\n", sub)
+    }
+}
+
+// ---------------------------------------------------------------------
+// cert subcommands
+// ---------------------------------------------------------------------
+func certCommand(args []string) {
+    if len(args) < 1 {
+        fmt.Println("Usage: tunnelgate cert renew")
+        return
+    }
+    if args[0] == "renew" {
+        cfg, err := config.Load(cfgPath)
+        if err != nil {
+            logger.Error("Load config", "error", err)
+            return
+        }
+        if err := cert.EnsureCertificate(cfg); err != nil {
+            logger.Error("Cert renewal failed", "error", err)
+        } else {
+            nginx.Reload()
+            fmt.Println("Certificate renewed.")
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// port subcommands
+// ---------------------------------------------------------------------
+func portCommand(args []string) {
+    if len(args) < 2 {
+        fmt.Println("Usage: tunnelgate port <add|remove> <port> [--tls]")
+        return
+    }
+    action := args[1]
+    cfg, err := config.Load(cfgPath)
+    if err != nil {
+        logger.Error("Load config", "error", err)
+        return
+    }
+
+    switch action {
+    case "add":
+        if len(args) < 3 {
+            fmt.Println("Usage: tunnelgate port add <port> [--tls]")
+            return
+        }
+        port, _ := strconv.Atoi(args[2])
+        if port == 0 {
+            logger.Error("Invalid port number")
+            return
+        }
+        tls := false
+        for _, a := range args {
+            if a == "--tls" {
+                tls = true
+                break
+            }
+        }
+        if tls {
+            cfg.Nginx.TLSPorts = append(cfg.Nginx.TLSPorts, port)
+        } else {
+            cfg.Nginx.HTTPPorts = append(cfg.Nginx.HTTPPorts, port)
+        }
+        if err := cfg.Save(cfgPath); err != nil {
+            logger.Error("Save config", "error", err)
+            return
+        }
+        // regenerate nginx
+        if err := nginx.Configure(cfg); err != nil {
+            logger.Error("Nginx config update failed", "error", err)
+            return
+        }
+        // restart proxy service
+        exec.Command("systemctl", "restart", "tunnelgate-proxy.service").Run()
+        // open firewall
+        exec.Command("iptables", "-A", "INPUT", "-p", "tcp", "--dport", strconv.Itoa(port), "-j", "ACCEPT").Run()
+        exec.Command("netfilter-persistent", "save").Run()
+        fmt.Printf("Port %d added (%s)\n", port, map[bool]string{true: "TLS", false: "HTTP"}[tls])
+
+    case "remove":
+        if len(args) < 3 {
+            fmt.Println("Usage: tunnelgate port remove <port>")
+            return
+        }
+        port, _ := strconv.Atoi(args[2])
+        if port == 0 {
+            logger.Error("Invalid port number")
+            return
+        }
+        // remove from slices
+        newHTTP := []int{}
+        for _, p := range cfg.Nginx.HTTPPorts {
+            if p != port {
+                newHTTP = append(newHTTP, p)
+            }
+        }
+        cfg.Nginx.HTTPPorts = newHTTP
+        newTLS := []int{}
+        for _, p := range cfg.Nginx.TLSPorts {
+            if p != port {
+                newTLS = append(newTLS, p)
+            }
+        }
+        cfg.Nginx.TLSPorts = newTLS
+        if err := cfg.Save(cfgPath); err != nil {
+            logger.Error("Save config", "error", err)
+            return
+        }
+        nginx.Configure(cfg)
+        exec.Command("systemctl", "restart", "tunnelgate-proxy.service").Run()
+        fmt.Printf("Port %d removed.\n", port)
+
+    default:
+        fmt.Printf("Unknown port action: %s\n", action)
     }
 }
