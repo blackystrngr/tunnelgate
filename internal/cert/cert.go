@@ -13,15 +13,13 @@ import (
 
 const certDir = "/etc/tunnelgate/certs"
 
+// EnsureCertificate checks if a valid certificate exists; if not, obtains one.
 func EnsureCertificate(cfg *config.Config) error {
-    // Check if cert already exists and is valid
     if valid, err := isCertValid(cfg.Domain); err == nil && valid {
         logger.Info("Certificate already valid", "domain", cfg.Domain)
         return nil
     }
-
     logger.Info("Obtaining certificate", "method", cfg.CertMethod, "domain", cfg.Domain)
-
     var lastErr error
     for attempt := 1; attempt <= 3; attempt++ {
         err := Obtain(cfg)
@@ -41,7 +39,7 @@ func isCertValid(domain string) (bool, error) {
     if _, err := os.Stat(certPath); err != nil {
         return false, err
     }
-    // Check expiry with openssl (at least 24h left)
+    // Check if expiry is more than 24h away
     cmd := exec.Command("openssl", "x509", "-in", certPath, "-noout", "-checkend", "86400")
     if err := cmd.Run(); err != nil {
         return false, err
@@ -49,6 +47,8 @@ func isCertValid(domain string) (bool, error) {
     return true, nil
 }
 
+// Obtain requests a new certificate (does NOT check for existing).
+// It's called by EnsureCertificate only when needed.
 func Obtain(cfg *config.Config) error {
     os.MkdirAll(certDir, 0700)
 
@@ -65,7 +65,6 @@ func Obtain(cfg *config.Config) error {
 }
 
 func obtainHTTP01(cfg *config.Config) error {
-    // Stop Nginx briefly to free port 80
     exec.Command("systemctl", "stop", "nginx").Run()
     defer exec.Command("systemctl", "start", "nginx").Run()
 
@@ -103,6 +102,6 @@ func obtainDNS01(cfg *config.Config) error {
 }
 
 func obtainCloudflareOrigin(cfg *config.Config) error {
-    // Stub – implement using Cloudflare API
-    return fmt.Errorf("Cloudflare Origin CA not yet implemented")
+    // Stub – implement later
+    return fmt.Errorf("Cloudflare Origin CA not implemented")
 }
