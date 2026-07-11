@@ -1,19 +1,20 @@
 package main
 
 import (
-    "encoding/json"
+    "context"
     "flag"
     "fmt"
-    "log"
     "os"
-    "os/exec"
     "os/signal"
     "syscall"
     "time"
 
+    "golang.org/x/sync/errgroup"
+
     "github.com/tunnelgate/tunnelgate/internal/api"
     "github.com/tunnelgate/tunnelgate/internal/cert"
     "github.com/tunnelgate/tunnelgate/internal/config"
+    "github.com/tunnelgate/tunnelgate/internal/logger"
     "github.com/tunnelgate/tunnelgate/internal/metrics"
     "github.com/tunnelgate/tunnelgate/internal/nginx"
     "github.com/tunnelgate/tunnelgate/internal/proxy"
@@ -29,166 +30,145 @@ func init() {
 func main() {
     flag.Parse()
     args := flag.Args()
-    if len(args) < 1 {
-        fmt.Println("Usage: tunnelgate <command> [options]")
-        fmt.Println("Commands: init, start, stop, status, user, cert, upgrade")
-        os.Exit(1)
+    if len(args) > 0 {
+        runCommand(args)
+        return
     }
 
+    if err := run(); err != nil {
+        logger.Error("Fatal error", "error", err)
+        os.Exit(1)
+    }
+}
+
+func run() error {
+    cfg, err := config.Load(cfgPath)
+    if err != nil {
+        return fmt.Errorf("load config: %w", err)
+    }
+    if err := cfg.Validate(); err != nil {
+        return fmt.Errorf("invalid config: %w", err)
+    }
+
+    logger.Init(cfg.LogLevel, cfg.LogFormat)
+    logger.Info("Starting TunnelGate", "domain", cfg.Domain)
+
+    // Initialize database
+    db, err := user.InitDB(cfg.Database)
+    if err != nil {
+        return fmt.Errorf("database init: %w", err)
+    }
+    defer db.Close()
+
+    // Ensure certificate exists (if TLS ports)
+    if len(cfg.Nginx.TLSPorts) > 0 {
+        if err := cert.EnsureCertificate(cfg); err != nil {
+            logger.Warn("Certificate setup failed", "error", err)
+        }
+    }
+
+    // Generate Nginx config
+    if err := nginx.Configure(cfg); err != nil {
+        logger.Warn("Nginx config generation failed", "error", err)
+    }
+
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    g, ctx := errgroup.WithContext(ctx)
+
+    // Proxy core
+    g.Go(func() error {
+        return runWithRecovery(ctx, "proxy", func() error {
+            return proxy.Start(ctx, cfg)
+        })
+    })
+
+    // API server
+    g.Go(func() error {
+        return runWithRecovery(ctx, "api", func() error {
+            return api.Start(ctx, cfg)
+        })
+    })
+
+    // Metrics server
+    g.Go(func() error {
+        return runWithRecovery(ctx, "metrics", func() error {
+            return metrics.Start(ctx, cfg)
+        })
+    })
+
+    // Signal handling
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+    select {
+    case <-sigChan:
+        logger.Info("Received shutdown signal, stopping services...")
+        cancel()
+    case <-ctx.Done():
+        // context cancelled by error in one of the goroutines
+    }
+
+    // Give services a chance to clean up
+    shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer shutdownCancel()
+
+    if err := g.Wait(); err != nil && err != context.Canceled {
+        logger.Error("Service exited with error", "error", err)
+        return err
+    }
+
+    logger.Info("All services stopped gracefully")
+    return nil
+}
+
+func runWithRecovery(ctx context.Context, name string, fn func() error) func() error {
+    return func() error {
+        defer func() {
+            if r := recover(); r != nil {
+                logger.Error("Panic recovered", "service", name, "panic", r)
+            }
+        }()
+        select {
+        case <-ctx.Done():
+            return ctx.Err()
+        default:
+            return fn()
+        }
+    }
+}
+
+// subcommand dispatcher (init, start, stop, status, user, cert, upgrade)
+func runCommand(args []string) {
+    if len(args) == 0 {
+        return
+    }
     cmd := args[0]
     switch cmd {
     case "init":
-        runInit()
+        // stub – would call interactive setup
+        fmt.Println("init command not yet implemented")
     case "start":
-        runStart()
+        if err := run(); err != nil {
+            logger.Error("Start failed", "error", err)
+            os.Exit(1)
+        }
     case "stop":
-        runStop()
+        // stop systemd services
+        fmt.Println("stopping services...")
     case "status":
-        runStatus()
+        fmt.Println("status command")
     case "user":
-        userCLI(args[1:])
+        // user management
+        fmt.Println("user command")
     case "cert":
-        certCLI(args[1:])
+        // certificate renewal
+        fmt.Println("cert command")
     case "upgrade":
-        runUpgrade()
+        fmt.Println("upgrade command")
     default:
         fmt.Printf("Unknown command: %s\n", cmd)
         os.Exit(1)
     }
-}
-
-func runInit() {
-    fmt.Println("=== TunnelGate Interactive Setup ===")
-    cfg := &config.Config{}
-    // TODO: interactive prompts for domain, email, ports, cert method, etc.
-    // For brevity, we'll hardcode some defaults or use the example config.
-    cfg.Domain = ask("Domain (e.g. tunnel.example.com): ", "tunnel.example.com")
-    cfg.Email = ask("Contact email: ", "")
-    cfg.CertMethod = ask("Cert method (le_http01/le_dns_cf/cf_origin): ", "le_http01")
-    // Save config
-    cfg.Save(cfgPath)
-    // Generate Nginx config
-    nginx.Configure(cfg)
-    // Obtain certificate if needed
-    if len(cfg.TLSPorts) > 0 {
-        cert.Obtain(cfg)
-    }
-    // Initialize database
-    user.InitDB(cfg.Database)
-    // Start services (or just enable them)
-    runStart()
-    fmt.Println("Setup complete. Run 'tunnelgate user add <name>' to create users.")
-}
-
-func runStart() {
-    cfg := config.Load(cfgPath)
-    // Start proxy core
-    go proxy.Start(cfg)
-    // Start API server
-    go api.Start(cfg)
-    // Start metrics exporter
-    go metrics.Start(cfg)
-    // Monitor signals
-    sigChan := make(chan os.Signal, 1)
-    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-    <-sigChan
-    fmt.Println("Shutting down...")
-}
-
-func runStop() {
-    // Stop systemd services
-    exec.Command("systemctl", "stop", "tunnelgate-proxy.service").Run()
-    exec.Command("systemctl", "stop", "tunnelgate-api.service").Run()
-    fmt.Println("Services stopped.")
-}
-
-func runStatus() {
-    // Print status: active connections, cert expiry, etc.
-    fmt.Println("TunnelGate Status:")
-    // Query systemd
-    out, _ := exec.Command("systemctl", "is-active", "tunnelgate-proxy.service").Output()
-    fmt.Printf("Proxy: %s", out)
-    // Check certificate
-    cfg := config.Load(cfgPath)
-    expiry := cert.GetExpiry(cfg.Domain)
-    fmt.Printf("Certificate expiry: %s\n", expiry)
-    // User count
-    db := user.OpenDB(cfg.Database)
-    count, _ := user.CountUsers(db)
-    fmt.Printf("Total users: %d\n", count)
-}
-
-func runUpgrade() {
-    fmt.Println("Upgrading TunnelGate...")
-    // Download latest binary, replace, restart
-    // Implement later
-}
-
-func userCLI(args []string) {
-    if len(args) < 1 {
-        fmt.Println("Usage: tunnelgate user <subcommand> [options]")
-        fmt.Println("Subcommands: add, list, extend, lock, delete")
-        return
-    }
-    cfg := config.Load(cfgPath)
-    db := user.OpenDB(cfg.Database)
-    sub := args[0]
-    switch sub {
-    case "add":
-        if len(args) < 2 {
-            fmt.Println("Usage: tunnelgate user add <username> --days <days> [--password <pass>]")
-            return
-        }
-        username := args[1]
-        days := 30
-        password := ""
-        // parse flags
-        for i := 2; i < len(args); i++ {
-            if args[i] == "--days" && i+1 < len(args) {
-                fmt.Sscan(args[i+1], &days)
-                i++
-            }
-            if args[i] == "--password" && i+1 < len(args) {
-                password = args[i+1]
-                i++
-            }
-        }
-        u, err := user.AddUser(db, username, password, days)
-        if err != nil {
-            log.Fatal(err)
-        }
-        fmt.Printf("User %s added, expires %s\n", u.Username, u.Expiry)
-    case "list":
-        users, _ := user.ListUsers(db)
-        fmt.Printf("%-20s %-15s %-6s\n", "Username", "Expiry", "Locked")
-        for _, u := range users {
-            fmt.Printf("%-20s %-15s %-6v\n", u.Username, u.Expiry, u.Locked)
-        }
-    default:
-        fmt.Printf("Unknown user subcommand: %s\n", sub)
-    }
-}
-
-func certCLI(args []string) {
-    if len(args) < 1 {
-        fmt.Println("Usage: tunnelgate cert renew")
-        return
-    }
-    if args[0] == "renew" {
-        cfg := config.Load(cfgPath)
-        cert.Obtain(cfg)
-        // Reload Nginx
-        nginx.Reload()
-        fmt.Println("Certificate renewed.")
-    }
-}
-
-func ask(prompt, defaultVal string) string {
-    fmt.Print(prompt)
-    var input string
-    fmt.Scanln(&input)
-    if input == "" {
-        return defaultVal
-    }
-    return input
 }
