@@ -7,6 +7,7 @@ import (
     "path/filepath"
 
     "github.com/tunnelgate/tunnelgate/internal/config"
+    "github.com/tunnelgate/tunnelgate/internal/logger"
 )
 
 const nginxConfDir = "/etc/nginx/sites-available"
@@ -17,10 +18,7 @@ func Configure(cfg *config.Config) error {
     keyPath := "/etc/tunnelgate/certs/key.pem"
 
     // Build server blocks
-    httpBlock := ""
-    tlsBlock := ""
-
-    // Port 80 (plain HTTP)
+    var httpBlock string
     if len(cfg.Nginx.HTTPPorts) > 0 {
         httpBlock = fmt.Sprintf(`
 server {
@@ -37,8 +35,15 @@ server {
 }`, cfg.Nginx.HTTPPorts[0], domain, cfg.Proxy.ListenHost, cfg.Proxy.ListenPort)
     }
 
-    // Port 443 (TLS)
+    var tlsBlock string
     if len(cfg.Nginx.TLSPorts) > 0 {
+        // Check if certificate exists
+        if _, err := os.Stat(certPath); err != nil {
+            logger.Warn("Certificate file missing, skipping TLS config", "path", certPath)
+            // still return nil? Actually we can still generate TLS block but Nginx will fail.
+            // Better to return error.
+            return fmt.Errorf("certificate file missing: %s", certPath)
+        }
         tlsBlock = fmt.Sprintf(`
 server {
     listen %d ssl http2;
@@ -56,24 +61,36 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 }`, cfg.Nginx.TLSPorts[0], domain, certPath, keyPath,
-    cfg.Proxy.ListenHost, cfg.Proxy.ListenPort)
+            cfg.Proxy.ListenHost, cfg.Proxy.ListenPort)
     }
 
     fullConfig := httpBlock + "\n" + tlsBlock
     confPath := filepath.Join(nginxConfDir, "tunnelgate.conf")
     if err := os.WriteFile(confPath, []byte(fullConfig), 0644); err != nil {
-        return err
+        return fmt.Errorf("write config: %w", err)
     }
 
     // Enable site
-    exec.Command("ln", "-sf", confPath, "/etc/nginx/sites-enabled/").Run()
+    if err := os.Symlink(confPath, "/etc/nginx/sites-enabled/tunnelgate.conf"); err != nil && !os.IsExist(err) {
+        return fmt.Errorf("symlink: %w", err)
+    }
+
     // Test and reload
-    exec.Command("nginx", "-t").Run()
-    exec.Command("systemctl", "reload", "nginx").Run()
+    if err := exec.Command("nginx", "-t").Run(); err != nil {
+        return fmt.Errorf("nginx config test failed: %w", err)
+    }
+    if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+        return fmt.Errorf("nginx reload: %w", err)
+    }
     return nil
 }
 
-func Reload() {
-    exec.Command("nginx", "-t").Run()
-    exec.Command("systemctl", "reload", "nginx").Run()
+func Reload() error {
+    if err := exec.Command("nginx", "-t").Run(); err != nil {
+        return fmt.Errorf("nginx test failed: %w", err)
+    }
+    if err := exec.Command("systemctl", "reload", "nginx").Run(); err != nil {
+        return fmt.Errorf("nginx reload: %w", err)
+    }
+    return nil
 }
