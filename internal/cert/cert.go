@@ -2,30 +2,56 @@ package cert
 
 import (
     "fmt"
-    "log"
     "os"
     "os/exec"
     "path/filepath"
     "time"
 
     "github.com/tunnelgate/tunnelgate/internal/config"
+    "github.com/tunnelgate/tunnelgate/internal/logger"
 )
 
-const (
-    certDir = "/etc/tunnelgate/certs"
-)
+const certDir = "/etc/tunnelgate/certs"
 
-func Obtain(cfg *config.Config) error {
-    // Ensure acme.sh installed
-    if _, err := exec.LookPath("acme.sh"); err != nil {
-        // Install acme.sh
-        cmd := exec.Command("bash", "-c", "curl -s https://get.acme.sh | sh")
-        cmd.Run()
+func EnsureCertificate(cfg *config.Config) error {
+    // Check if cert already exists and is valid
+    if valid, err := isCertValid(cfg.Domain); err == nil && valid {
+        logger.Info("Certificate already valid", "domain", cfg.Domain)
+        return nil
     }
 
+    logger.Info("Obtaining certificate", "method", cfg.CertMethod, "domain", cfg.Domain)
+
+    var lastErr error
+    for attempt := 1; attempt <= 3; attempt++ {
+        err := Obtain(cfg)
+        if err == nil {
+            return nil
+        }
+        lastErr = err
+        logger.Warn("Certificate issuance attempt failed",
+            "attempt", attempt, "error", err)
+        time.Sleep(time.Duration(attempt*5) * time.Second)
+    }
+    return fmt.Errorf("certificate issuance failed after 3 attempts: %w", lastErr)
+}
+
+func isCertValid(domain string) (bool, error) {
+    certPath := filepath.Join(certDir, "fullchain.pem")
+    if _, err := os.Stat(certPath); err != nil {
+        return false, err
+    }
+    // Check expiry with openssl (at least 24h left)
+    cmd := exec.Command("openssl", "x509", "-in", certPath, "-noout", "-checkend", "86400")
+    if err := cmd.Run(); err != nil {
+        return false, err
+    }
+    return true, nil
+}
+
+func Obtain(cfg *config.Config) error {
     os.MkdirAll(certDir, 0700)
 
-    // Choose method
     switch cfg.CertMethod {
     case "le_http01":
         return obtainHTTP01(cfg)
@@ -39,7 +65,7 @@ func Obtain(cfg *config.Config) error {
 }
 
 func obtainHTTP01(cfg *config.Config) error {
-    // Stop any service using port 80 (e.g., nginx)
+    // Stop Nginx briefly to free port 80
     exec.Command("systemctl", "stop", "nginx").Run()
     defer exec.Command("systemctl", "start", "nginx").Run()
 
@@ -50,9 +76,8 @@ func obtainHTTP01(cfg *config.Config) error {
     cmd.Env = append(os.Environ(), "HOME=/root")
     output, err := cmd.CombinedOutput()
     if err != nil {
-        return fmt.Errorf("acme.sh failed: %s", output)
+        return fmt.Errorf("acme.sh failed: %w\n%s", err, output)
     }
-    // Install certificate
     installCmd := exec.Command("acme.sh", "--install-cert", "-d", cfg.Domain,
         "--cert-file", filepath.Join(certDir, "cert.pem"),
         "--key-file", filepath.Join(certDir, "key.pem"),
@@ -66,8 +91,9 @@ func obtainDNS01(cfg *config.Config) error {
     env = append(env, "CF_Token="+cfg.CFAPIToken)
     cmd := exec.Command("acme.sh", "--issue", "--dns", "dns_cf", "-d", cfg.Domain)
     cmd.Env = env
-    cmd.Run()
-    // install similarly
+    if err := cmd.Run(); err != nil {
+        return err
+    }
     installCmd := exec.Command("acme.sh", "--install-cert", "-d", cfg.Domain,
         "--cert-file", filepath.Join(certDir, "cert.pem"),
         "--key-file", filepath.Join(certDir, "key.pem"),
@@ -77,16 +103,6 @@ func obtainDNS01(cfg *config.Config) error {
 }
 
 func obtainCloudflareOrigin(cfg *config.Config) error {
-    // Use Cloudflare Origin CA API (simplified – in reality we'd use curl or HTTP client)
-    // For brevity we call a helper script.
-    return nil
-}
-
-func GetExpiry(domain string) time.Time {
-    // Use openssl to parse expiry
-    certPath := filepath.Join(certDir, "fullchain.pem")
-    cmd := exec.Command("openssl", "x509", "-in", certPath, "-noout", "-enddate")
-    out, _ := cmd.Output()
-    // parse "notAfter=..."
-    return time.Now()
+    // Stub – implement using Cloudflare API
+    return fmt.Errorf("Cloudflare Origin CA not yet implemented")
 }
