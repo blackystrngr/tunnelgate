@@ -1,0 +1,8 @@
+groups:
+  - name: tunnelgate
+    rules:
+      - alert: CertificateExpiringSoon
+        expr: tunnelgate_certificate_days_left < 7
+        for: 5m
+        annotations:
+          summary: "TLS certificate expiring soon"
