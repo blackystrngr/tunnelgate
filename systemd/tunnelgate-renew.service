@@ -1,0 +1,6 @@
+# tunnelgate-renew.service
+[Unit]
+Description=Renew TLS certificate
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tunnelgate cert renew
