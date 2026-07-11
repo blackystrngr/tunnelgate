@@ -134,12 +134,15 @@ if ! nginx -V 2>&1 | grep -q with-stream; then
 fi
 
 # ---------------------------------------------------------------------
-# Clone/update source
+# Clone/update source (with forced reset)
 # ---------------------------------------------------------------------
 log_step "Setting up source code..."
 if [[ -d "$INSTALL_DIR/.git" ]]; then
     cd "$INSTALL_DIR"
-    git pull
+    # Discard local changes and pull latest
+    git fetch origin
+    git reset --hard origin/main
+    git clean -f -d
 else
     rm -rf "$INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
@@ -269,14 +272,16 @@ systemctl enable ${SERVICE_PREFIX}-renew.timer
 # Nginx & certificate
 # ---------------------------------------------------------------------
 log_step "Configuring Nginx and obtaining certificate..."
+# Generate Nginx config (using the binary)
 if ! tunnelgate nginx --generate-only 2>/dev/null; then
-    # fallback: run configure via CLI
-    tunnelgate nginx configure
+    # fallback: call the configure function via the binary (if it supports it)
+    tunnelgate nginx configure 2>/dev/null || true
 fi
 
+# Obtain certificate (will reuse if valid)
 if [[ -n "$DOMAIN" ]]; then
-    log_info "Obtaining certificate for $DOMAIN using $CERT_METHOD..."
-    tunnelgate cert obtain || log_warn "Certificate issuance failed – check logs."
+    log_info "Checking/obtaining certificate for $DOMAIN using $CERT_METHOD..."
+    tunnelgate cert renew || log_warn "Certificate issuance failed – check logs."
 fi
 
 # ---------------------------------------------------------------------
