@@ -15,7 +15,7 @@ type Config struct {
 
     Proxy struct {
         ListenHost  string `yaml:"listen_host"`
-        ListenPort  int    `yaml:"listen_port"`
+        ListenPort  int    `yaml:"listen_port"` // unused – we listen on all configured ports
         IdleTimeout int    `yaml:"idle_timeout_seconds"`
         SharedPass  string `yaml:"shared_pass"`
     } `yaml:"proxy"`
@@ -36,11 +36,9 @@ type Config struct {
     CFEmail          string `yaml:"cf_email"`
     CFGlobalAPIKey   string `yaml:"cf_global_api_key"`
 
-    Database string `yaml:"database"`
-
-    // Logging
-    LogLevel  string `yaml:"log_level"`
-    LogFormat string `yaml:"log_format"`
+    Database   string `yaml:"database"`
+    LogLevel   string `yaml:"log_level"`
+    LogFormat  string `yaml:"log_format"`
 }
 
 func Load(path string) (*Config, error) {
@@ -70,11 +68,18 @@ func (c *Config) Validate() error {
     if c.BackendPort <= 0 || c.BackendPort > 65535 {
         return fmt.Errorf("invalid backend_port: %d", c.BackendPort)
     }
-    if c.Proxy.ListenPort <= 0 || c.Proxy.ListenPort > 65535 {
-        return fmt.Errorf("invalid proxy.listen_port: %d", c.Proxy.ListenPort)
-    }
     if len(c.Nginx.HTTPPorts) == 0 && len(c.Nginx.TLSPorts) == 0 {
         return fmt.Errorf("at least one HTTP or TLS port must be configured")
+    }
+    for _, p := range c.Nginx.HTTPPorts {
+        if p < 1 || p > 65535 {
+            return fmt.Errorf("invalid HTTP port: %d", p)
+        }
+    }
+    for _, p := range c.Nginx.TLSPorts {
+        if p < 1 || p > 65535 {
+            return fmt.Errorf("invalid TLS port: %d", p)
+        }
     }
     validMethods := map[string]bool{
         "le_http01": true,
