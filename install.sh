@@ -1,200 +1,339 @@
 #!/usr/bin/env bash
-# TunnelGate – All‑in‑one installer (iptables edition)
-# Usage: curl -sSL https://raw.githubusercontent.com/blackystrngr/tunnelgate/main/install.sh | sudo bash
+# TunnelGate – All‑in‑one installer
+# Usage: sudo ./install.sh              # normal install
+#        sudo ./install.sh --clean      # remove everything EXCEPT certificates
 
 set -euo pipefail
 
 # ---------------------------------------------------------------------
-# Colors and helpers
+# Configuration
+# ---------------------------------------------------------------------
+REPO_URL="https://github.com/blackystrngr/tunnelgate.git"
+INSTALL_DIR="/opt/tunnelgate"
+BIN_DIR="/usr/local/bin"
+CONFIG_DIR="/etc/tunnelgate"
+DATA_DIR="/var/lib/tunnelgate"
+CERT_DIR="/etc/tunnelgate/certs"
+NGINX_SITE="tunnelgate.conf"
+SERVICE_PREFIX="tunnelgate"
+SYSTEMD_DIR="/etc/systemd/system"
+
+# ---------------------------------------------------------------------
+# Colors and logging
 # ---------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
-NC='\033[0m' # No Color
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-info()  { echo -e "${GREEN}[+]${NC} $1"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
-error() { echo -e "${RED}[X]${NC} $1"; exit 1; }
+log_info()  { echo -e "${GREEN}[+]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*"; }
+log_warn()  { echo -e "${YELLOW}[!]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*"; }
+log_error() { echo -e "${RED}[X]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*" >&2; }
+log_step()  { echo -e "${BLUE}[*]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*"; }
 
 # ---------------------------------------------------------------------
-# Root check
+# Cleanup – preserves certificates
 # ---------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    error "This script must be run as root. Use: sudo bash install.sh"
+cleanup_all() {
+    log_warn "Performing cleanup (certificates in $CERT_DIR will be preserved)..."
+
+    # Stop services
+    for svc in proxy api renew; do
+        systemctl stop "${SERVICE_PREFIX}-${svc}.service" 2>/dev/null || true
+        systemctl disable "${SERVICE_PREFIX}-${svc}.service" 2>/dev/null || true
+    done
+    systemctl stop "${SERVICE_PREFIX}-renew.timer" 2>/dev/null || true
+    systemctl disable "${SERVICE_PREFIX}-renew.timer" 2>/dev/null || true
+
+    rm -f "${SYSTEMD_DIR}/${SERVICE_PREFIX}-"*.service
+    rm -f "${SYSTEMD_DIR}/${SERVICE_PREFIX}-"*.timer
+    systemctl daemon-reload
+
+    rm -f "${BIN_DIR}/tunnelgate"
+    rm -rf "$CONFIG_DIR" "$DATA_DIR"
+    log_info "Removed config and data, but preserved $CERT_DIR"
+
+    rm -rf "$INSTALL_DIR"
+
+    rm -f "/etc/nginx/sites-available/$NGINX_SITE"
+    rm -f "/etc/nginx/sites-enabled/$NGINX_SITE"
+    systemctl reload nginx 2>/dev/null || true
+
+    log_info "Cleanup completed. Certificates remain in $CERT_DIR."
+    log_info "To also remove certificates, manually delete: rm -rf $CERT_DIR"
+}
+
+trap 'log_error "Installation failed at step: $BASH_COMMAND"; exit 1' ERR
+
+if [[ $# -gt 0 && "$1" == "--clean" ]]; then
+    cleanup_all
+    exit 0
 fi
 
-# ---------------------------------------------------------------------
-# Detect OS
-# ---------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    log_error "This script must be run as root. Use: sudo $0"
+    exit 1
+fi
+
+# OS detection
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     OS=$ID
     VERSION=$VERSION_ID
 else
-    error "Unsupported OS – only Debian/Ubuntu are supported."
+    log_error "Unsupported OS – only Debian/Ubuntu are supported."
+    exit 1
 fi
-
 case $OS in
-    debian|ubuntu)
-        info "Detected $OS $VERSION"
-        ;;
-    *)
-        error "Unsupported OS: $OS – only Debian/Ubuntu are supported."
-        ;;
+    debian|ubuntu) log_info "Detected $OS $VERSION" ;;
+    *) log_error "Unsupported OS: $OS"; exit 1 ;;
 esac
 
 # ---------------------------------------------------------------------
-# Install base packages (including iptables)
+# Interactive input
 # ---------------------------------------------------------------------
-info "Updating package lists..."
+read -p "Domain (e.g., tunnel.example.com): " DOMAIN
+read -p "Email (for Let's Encrypt): " EMAIL
+echo "Choose certificate method:"
+echo "  1) Let's Encrypt HTTP-01 (port 80, standalone)"
+echo "  2) Let's Encrypt DNS-01 via Cloudflare (requires API token)"
+echo "  3) Cloudflare Origin CA (requires email + Global API Key)"
+read -p "Choice (1/2/3): " CERT_CHOICE
+case $CERT_CHOICE in
+    1) CERT_METHOD="le_http01" ;;
+    2) CERT_METHOD="le_dns_cf"
+       read -p "Cloudflare API Token: " CF_TOKEN ;;
+    3) CERT_METHOD="cf_origin"
+       read -p "Cloudflare Email: " CF_EMAIL
+       read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY ;;
+    *) log_error "Invalid choice"; exit 1 ;;
+esac
+
+read -p "HTTP ports (comma‑separated, e.g., 80,8080): " HTTP_PORTS_INPUT
+read -p "TLS ports (comma‑separated, e.g., 443,8443): " TLS_PORTS_INPUT
+
+# Convert to YAML arrays
+HTTP_PORTS_YAML=$(echo "$HTTP_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
+TLS_PORTS_YAML=$(echo "$TLS_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
+
+# ---------------------------------------------------------------------
+# Install dependencies
+# ---------------------------------------------------------------------
+log_step "Installing system packages..."
 apt-get update -y
-
-info "Installing required packages..."
 apt-get install -y \
-    curl \
-    wget \
-    git \
-    make \
-    golang-go \
-    nginx-extras \
-    certbot \
-    python3-certbot-nginx \
-    dropbear \
-    iptables \
-    iptables-persistent \
-    openssl \
-    sqlite3
+    curl wget git make golang-go \
+    nginx-extras certbot python3-certbot-nginx \
+    dropbear iptables iptables-persistent \
+    openssl sqlite3
 
-# Verify Nginx stream module
 if ! nginx -V 2>&1 | grep -q with-stream; then
-    error "Nginx installed without stream module. Please install nginx-extras manually."
+    log_error "Nginx installed without stream module. Please install nginx-extras manually."
+    exit 1
 fi
 
 # ---------------------------------------------------------------------
-# Determine working directory
+# Clone/update source
 # ---------------------------------------------------------------------
-if [[ -d "$(pwd)/.git" ]] && grep -q "tunnelgate" "$(pwd)/README.md" 2>/dev/null; then
-    REPO_DIR="$(pwd)"
-    info "Using existing repository at $REPO_DIR"
+log_step "Setting up source code..."
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+    cd "$INSTALL_DIR"
+    git pull
 else
-    REPO_DIR="/opt/tunnelgate"
-    info "Cloning TunnelGate into $REPO_DIR ..."
-    rm -rf "$REPO_DIR"
-    git clone https://github.com/blackystrngr/tunnelgate.git "$REPO_DIR"
-    cd "$REPO_DIR"
+    rm -rf "$INSTALL_DIR"
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
 fi
 
 # ---------------------------------------------------------------------
-# Build the binary
+# Build
 # ---------------------------------------------------------------------
-info "Building tunnelgate binary..."
+log_step "Building tunnelgate binary..."
 make clean
 make build
-
-BINARY="$REPO_DIR/bin/tunnelgate"
+BINARY="$INSTALL_DIR/bin/tunnelgate"
 if [[ ! -f "$BINARY" ]]; then
-    error "Build failed – binary not found."
+    log_error "Build failed – binary not found."
+    exit 1
+fi
+cp "$BINARY" "$BIN_DIR/tunnelgate"
+chmod +x "$BIN_DIR/tunnelgate"
+
+# ---------------------------------------------------------------------
+# Create directories and config
+# ---------------------------------------------------------------------
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CERT_DIR"
+chmod 700 "$CONFIG_DIR" "$DATA_DIR"
+
+if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
+    cat > "$CONFIG_DIR/config.yaml" <<EOF
+domain: $DOMAIN
+email: $EMAIL
+
+backend_host: 127.0.0.1
+backend_port: 109
+
+proxy:
+  listen_host: 127.0.0.1
+  listen_port: 8888
+  idle_timeout_seconds: 180
+  shared_pass: ""
+
+api:
+  listen_host: 127.0.0.1
+  listen_port: 8080
+  token: "$(openssl rand -hex 24)"
+
+nginx:
+  http_ports: [$HTTP_PORTS_YAML]
+  tls_ports: [$TLS_PORTS_YAML]
+
+cert_method: $CERT_METHOD
+cf_api_token: ${CF_TOKEN:-""}
+cf_email: ${CF_EMAIL:-""}
+cf_global_api_key: ${CF_GLOBAL_KEY:-""}
+
+database: $DATA_DIR/users.db
+
+log_level: info
+log_format: text
+EOF
+    chmod 600 "$CONFIG_DIR/config.yaml"
 fi
 
-cp "$BINARY" /usr/local/bin/tunnelgate
-chmod +x /usr/local/bin/tunnelgate
+# ---------------------------------------------------------------------
+# Systemd units
+# ---------------------------------------------------------------------
+log_step "Installing systemd units..."
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-proxy.service" <<EOF
+[Unit]
+Description=TunnelGate Proxy Core
+After=network.target
 
-# ---------------------------------------------------------------------
-# Prepare directories and default config
-# ---------------------------------------------------------------------
-mkdir -p /etc/tunnelgate /var/lib/tunnelgate /etc/tunnelgate/certs
-chmod 700 /etc/tunnelgate /var/lib/tunnelgate
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/local/bin/tunnelgate start
+Restart=always
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
 
-if [[ ! -f /etc/tunnelgate/config.yaml ]]; then
-    cp "$REPO_DIR/config.yaml.example" /etc/tunnelgate/config.yaml
-    chmod 600 /etc/tunnelgate/config.yaml
-fi
+[Install]
+WantedBy=multi-user.target
+EOF
 
-# ---------------------------------------------------------------------
-# Install systemd services
-# ---------------------------------------------------------------------
-info "Installing systemd service units..."
-cp "$REPO_DIR/systemd"/*.service /etc/systemd/system/ 2>/dev/null || warn "No systemd units found – skipping."
-cp "$REPO_DIR/systemd"/*.timer /etc/systemd/system/ 2>/dev/null || true
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-api.service" <<EOF
+[Unit]
+Description=TunnelGate Admin API
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/local/bin/tunnelgate api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-renew.service" <<EOF
+[Unit]
+Description=Renew TLS certificate
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tunnelgate cert renew
+EOF
+
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-renew.timer" <<EOF
+[Unit]
+Description=Daily TLS certificate renewal
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
 
 systemctl daemon-reload
-
-systemctl enable tunnelgate-proxy.service 2>/dev/null || true
-systemctl enable tunnelgate-api.service 2>/dev/null || true
-systemctl enable tunnelgate-renew.timer 2>/dev/null || true
+systemctl enable ${SERVICE_PREFIX}-proxy.service
+systemctl enable ${SERVICE_PREFIX}-api.service
+systemctl enable ${SERVICE_PREFIX}-renew.timer
 
 # ---------------------------------------------------------------------
-# Firewall (iptables) – safe setup
+# Nginx & certificate
 # ---------------------------------------------------------------------
-info "Configuring firewall (iptables)..."
+log_step "Configuring Nginx and obtaining certificate..."
+if ! tunnelgate nginx --generate-only 2>/dev/null; then
+    # fallback: run configure via CLI
+    tunnelgate nginx configure
+fi
 
-# Flush all existing rules
+if [[ -n "$DOMAIN" ]]; then
+    log_info "Obtaining certificate for $DOMAIN using $CERT_METHOD..."
+    tunnelgate cert obtain || log_warn "Certificate issuance failed – check logs."
+fi
+
+# ---------------------------------------------------------------------
+# Firewall (iptables)
+# ---------------------------------------------------------------------
+log_step "Configuring iptables firewall..."
 iptables -F
 iptables -X
 iptables -t nat -F
 iptables -t mangle -F
 
-# Set default policies: drop incoming/forward, allow outgoing
 iptables -P INPUT DROP
 iptables -P FORWARD DROP
 iptables -P OUTPUT ACCEPT
 
-# Allow loopback
 iptables -A INPUT -i lo -j ACCEPT
-
-# Allow established/related connections
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT   # SSH
 
-# Allow SSH (critical – prevents lockout)
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
+# Open all HTTP and TLS ports
+for p in $(echo "$HTTP_PORTS_INPUT,$TLS_PORTS_INPUT" | tr ',' ' '); do
+    iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
+done
 
-# Allow TunnelGate ports (plain HTTP and HTTPS)
-iptables -A INPUT -p tcp --dport 80 -j ACCEPT
-iptables -A INPUT -p tcp --dport 443 -j ACCEPT
-
-# Save rules permanently
 netfilter-persistent save
-info "Firewall rules applied and saved."
-
-# ---------------------------------------------------------------------
-# Run interactive setup
-# ---------------------------------------------------------------------
-info "Starting interactive configuration..."
-tunnelgate init
+log_info "Firewall rules applied and saved."
 
 # ---------------------------------------------------------------------
 # Start services
 # ---------------------------------------------------------------------
-info "Starting services..."
-systemctl start tunnelgate-proxy.service
-systemctl start tunnelgate-api.service
-systemctl start tunnelgate-renew.timer 2>/dev/null || true
+log_step "Starting services..."
+systemctl start ${SERVICE_PREFIX}-proxy.service
+systemctl start ${SERVICE_PREFIX}-api.service
+systemctl start ${SERVICE_PREFIX}-renew.timer
 
 # ---------------------------------------------------------------------
 # Final message
 # ---------------------------------------------------------------------
 echo ""
-info "TunnelGate has been successfully installed and started."
+log_info "TunnelGate installation complete!"
 echo ""
-echo "  - Domain:          $(grep ^domain: /etc/tunnelgate/config.yaml | awk '{print $2}')"
-echo "  - HTTP port:       80 (ws://)"
-echo "  - TLS port:        443 (wss://)"
-echo "  - Admin API:       http://127.0.0.1:8080 (token in config)"
-echo "  - Database:        /var/lib/tunnelgate/users.db"
-echo ""
-echo "Firewall rules (iptables) applied:"
-echo "  - SSH (22), HTTP (80), HTTPS (443) are open."
-echo "  - All other incoming ports are DROPPED."
+echo "  - Domain:          $DOMAIN"
+echo "  - HTTP ports:      $HTTP_PORTS_INPUT"
+echo "  - TLS ports:       $TLS_PORTS_INPUT"
+echo "  - Admin API:       http://127.0.0.1:8080 (token in $CONFIG_DIR/config.yaml)"
+echo "  - Database:        $DATA_DIR/users.db"
 echo ""
 echo "Next steps:"
 echo "  1. Add a user:    tunnelgate user add <username> --days 30"
 echo "  2. Check status:  tunnelgate status"
-echo "  3. View logs:     journalctl -u tunnelgate-proxy -f"
+echo "  3. View logs:     journalctl -u ${SERVICE_PREFIX}-proxy -f"
 echo ""
 echo "Configure HTTP Injector with:"
-echo "  - SSH Host:       $(grep ^domain: /etc/tunnelgate/config.yaml | awk '{print $2}')"
-echo "  - SSH Port:       80 or 443"
+echo "  - SSH Host:       $DOMAIN"
+echo "  - SSH Port:       (any of the configured ports)"
 echo "  - Username:       <your user>"
 echo "  - Password:       <the one you set>"
 echo "  - Payload:        any HTTP GET with or without Upgrade header."
 echo ""
+echo "To clean everything EXCEPT certificates, run: sudo $0 --clean"
