@@ -13,11 +13,11 @@ proxy:
 api:
   listen_host: 127.0.0.1
   listen_port: 8080
-  token: "change-me-please"
+  token: "your-secure-token"
 
 nginx:
-  http_ports: [80]
-  tls_ports: [443]
+  http_ports: [80, 8080]
+  tls_ports: [443, 8443]
 
 cert_method: le_http01
 cf_api_token: ""
@@ -26,6 +26,5 @@ cf_global_api_key: ""
 
 database: /var/lib/tunnelgate/users.db
 
-# Logging
-log_level: info   # debug, info, warn, error
-log_format: text  # text or json
+log_level: info
+log_format: text
