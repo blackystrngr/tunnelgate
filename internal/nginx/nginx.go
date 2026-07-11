@@ -17,10 +17,9 @@ func Configure(cfg *config.Config) error {
     certPath := "/etc/tunnelgate/certs/fullchain.pem"
     keyPath := "/etc/tunnelgate/certs/key.pem"
 
-    // Build server blocks
-    var httpBlock string
-    if len(cfg.Nginx.HTTPPorts) > 0 {
-        httpBlock = fmt.Sprintf(`
+    var httpBlocks string
+    for _, port := range cfg.Nginx.HTTPPorts {
+        httpBlocks += fmt.Sprintf(`
 server {
     listen %d;
     server_name %s;
@@ -32,19 +31,17 @@ server {
         proxy_read_timeout 3600s;
         proxy_buffering off;
     }
-}`, cfg.Nginx.HTTPPorts[0], domain, cfg.Proxy.ListenHost, cfg.Proxy.ListenPort)
+}`, port, domain, cfg.Proxy.ListenHost, port)
     }
 
-    var tlsBlock string
-    if len(cfg.Nginx.TLSPorts) > 0 {
+    var tlsBlocks string
+    for _, port := range cfg.Nginx.TLSPorts {
         // Check if certificate exists
         if _, err := os.Stat(certPath); err != nil {
-            logger.Warn("Certificate file missing, skipping TLS config", "path", certPath)
-            // still return nil? Actually we can still generate TLS block but Nginx will fail.
-            // Better to return error.
-            return fmt.Errorf("certificate file missing: %s", certPath)
+            logger.Warn("Certificate file missing, skipping TLS port", "port", port)
+            continue
         }
-        tlsBlock = fmt.Sprintf(`
+        tlsBlocks += fmt.Sprintf(`
 server {
     listen %d ssl http2;
     server_name %s;
@@ -60,18 +57,19 @@ server {
         proxy_buffering off;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
-}`, cfg.Nginx.TLSPorts[0], domain, certPath, keyPath,
-            cfg.Proxy.ListenHost, cfg.Proxy.ListenPort)
+}`, port, domain, certPath, keyPath,
+            cfg.Proxy.ListenHost, port)
     }
 
-    fullConfig := httpBlock + "\n" + tlsBlock
+    fullConfig := httpBlocks + "\n" + tlsBlocks
     confPath := filepath.Join(nginxConfDir, "tunnelgate.conf")
     if err := os.WriteFile(confPath, []byte(fullConfig), 0644); err != nil {
         return fmt.Errorf("write config: %w", err)
     }
 
-    // Enable site
-    if err := os.Symlink(confPath, "/etc/nginx/sites-enabled/tunnelgate.conf"); err != nil && !os.IsExist(err) {
+    // Symlink
+    symlinkPath := "/etc/nginx/sites-enabled/tunnelgate.conf"
+    if err := os.Symlink(confPath, symlinkPath); err != nil && !os.IsExist(err) {
         return fmt.Errorf("symlink: %w", err)
     }
 
