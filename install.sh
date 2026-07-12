@@ -122,13 +122,11 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Clean Go module cache and upgrade sys package
+# Clean Go module cache and update dependencies
 # ---------------------------------------------------------------------
 log_step "Cleaning Go module cache and updating dependencies..."
 go clean -modcache
-
-# Ensure we have a proper go.mod with correct sys version
-go get -u golang.org/x/sys@v0.20.0
+go get -u all
 go mod tidy
 
 # ---------------------------------------------------------------------
