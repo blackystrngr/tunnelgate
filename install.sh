@@ -6,6 +6,21 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------
+# Declare all variables with empty defaults (fixes unbound errors)
+# ---------------------------------------------------------------------
+DOMAIN=""
+EMAIL=""
+CERT_CHOICE=""
+CERT_METHOD=""
+CF_TOKEN=""
+CF_EMAIL=""
+CF_GLOBAL_KEY=""
+HTTP_PORTS_INPUT=""
+TLS_PORTS_INPUT=""
+HTTP_PORTS_YAML=""
+TLS_PORTS_YAML=""
+
+# ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
 REPO_URL="https://github.com/blackystrngr/tunnelgate.git"
@@ -184,17 +199,6 @@ chmod +x "$BIN_DIR/tunnelgate"
 # Now ask for configuration (after successful build)
 # ---------------------------------------------------------------------
 log_step "Configuration setup"
-
-# Declare variables with default empty
-DOMAIN=""
-EMAIL=""
-CERT_CHOICE=""
-CERT_METHOD=""
-CF_TOKEN=""
-CF_EMAIL=""
-CF_GLOBAL_KEY=""
-HTTP_PORTS_INPUT=""
-TLS_PORTS_INPUT=""
 
 # Mandatory domain
 while [[ -z "$DOMAIN" ]]; do
