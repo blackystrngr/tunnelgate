@@ -17,7 +17,7 @@ NGINX_SITE="tunnelgate.conf"
 SERVICE_PREFIX="tunnelgate"
 SYSTEMD_DIR="/etc/systemd/system"
 
-# Defaults (will be prompted if not provided via env)
+# Defaults (can be overridden by env)
 DOMAIN="${DOMAIN:-tunnel.example.com}"
 EMAIL="${EMAIL:-admin@example.com}"
 HTTP_PORTS="${HTTP_PORTS:-80}"
@@ -69,29 +69,14 @@ esac
 # =====================================================================
 log_step "Removing conflicting web servers..."
 
-# Stop and remove Apache
-if systemctl list-units --full -all | grep -q apache2; then
-    log_info "Removing Apache..."
-    systemctl stop apache2 2>/dev/null || true
-    systemctl disable apache2 2>/dev/null || true
-    apt-get remove -y apache2 apache2-* 2>/dev/null || true
-fi
-
-# Stop and remove lighttpd
-if systemctl list-units --full -all | grep -q lighttpd; then
-    log_info "Removing lighttpd..."
-    systemctl stop lighttpd 2>/dev/null || true
-    systemctl disable lighttpd 2>/dev/null || true
-    apt-get remove -y lighttpd 2>/dev/null || true
-fi
-
-# Remove any existing Nginx that might conflict
-if systemctl list-units --full -all | grep -q nginx; then
-    log_info "Removing existing Nginx..."
-    systemctl stop nginx 2>/dev/null || true
-    systemctl disable nginx 2>/dev/null || true
-    apt-get remove -y nginx nginx-common nginx-core nginx-full 2>/dev/null || true
-fi
+for pkg in apache2 lighttpd nginx nginx-common nginx-core nginx-full; do
+    if dpkg -l | grep -q "^ii  $pkg "; then
+        log_info "Removing $pkg..."
+        systemctl stop "$pkg" 2>/dev/null || true
+        systemctl disable "$pkg" 2>/dev/null || true
+        apt-get remove -y "$pkg" 2>/dev/null || true
+    fi
+done
 
 # Clean up any remaining configs
 rm -rf /etc/nginx 2>/dev/null || true
@@ -100,6 +85,12 @@ rm -rf /etc/nginx 2>/dev/null || true
 # STEP 2: KILL PROCESSES ON CONFLICTING PORTS
 # =====================================================================
 log_step "Killing processes on conflicting ports..."
+
+# Install psmisc if not present (provides fuser)
+if ! command -v fuser &>/dev/null; then
+    apt-get update -y
+    apt-get install -y psmisc
+fi
 
 for port in 80 443 2053 2083 2087 2096 8443; do
     if fuser -k "$port"/tcp 2>/dev/null; then
@@ -147,7 +138,7 @@ apt-get install -y \
     openssl sqlite3 \
     net-tools \
     lsof \
-    fuser
+    psmisc
 
 # Verify Nginx stream module
 if ! nginx -V 2>&1 | grep -q with-stream; then
@@ -479,11 +470,16 @@ for p in $(echo "$HTTP_PORTS,$TLS_PORTS" | tr ',' ' '); do
     iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
 done
 
-# Save
-netfilter-persistent save 2>/dev/null || {
-    # Fallback for systems without netfilter-persistent
-    iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-}
+# Save rules (handle both netfilter-persistent and iptables-persistent)
+if command -v netfilter-persistent &>/dev/null; then
+    netfilter-persistent save
+elif command -v iptables-save &>/dev/null; then
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4
+    log_info "iptables rules saved to /etc/iptables/rules.v4"
+else
+    log_warn "Could not save iptables rules permanently."
+fi
 
 log_info "Firewall rules applied."
 
