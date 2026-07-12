@@ -2,7 +2,6 @@ package logger
 
 import (
     "fmt"
-    "log"
     "os"
     "strings"
     "sync"
@@ -12,7 +11,7 @@ import (
 var (
     mu     sync.Mutex
     level  = InfoLevel
-    format = "text" // text or json
+    format = "text"
 )
 
 type LogLevel int
@@ -46,7 +45,7 @@ func Init(lvl string, fmtStr string) {
     }
 }
 
-func logMessage(lvl LogLevel, msg string, args ...any) {
+func logMessage(lvl LogLevel, msg string, args ...interface{}) {
     mu.Lock()
     defer mu.Unlock()
     if lvl < level {
@@ -64,9 +63,7 @@ func logMessage(lvl LogLevel, msg string, args ...any) {
     case ErrorLevel:
         prefix = "ERROR"
     }
-    // build message with args
     if len(args) > 0 {
-        // simple key=value formatting
         var pairs []string
         for i := 0; i+1 < len(args); i += 2 {
             key := args[i]
@@ -78,15 +75,14 @@ func logMessage(lvl LogLevel, msg string, args ...any) {
         }
     }
     if format == "json" {
-        // simplistic JSON – enough for basic use
         fmt.Fprintf(os.Stderr, `{"time":"%s","level":"%s","msg":"%s"}`, now, prefix, msg)
     } else {
         fmt.Fprintf(os.Stderr, "[%s] %s %s\n", now, prefix, msg)
     }
 }
 
-func Debug(msg string, args ...any) { logMessage(DebugLevel, msg, args...) }
-func Info(msg string, args ...any)  { logMessage(InfoLevel, msg, args...) }
-func Warn(msg string, args ...any)  { logMessage(WarnLevel, msg, args...) }
-func Error(msg string, args ...any) { logMessage(ErrorLevel, msg, args...) }
-func Fatal(msg string, args ...any) { logMessage(ErrorLevel, msg, args...); os.Exit(1) }
+func Debug(msg string, args ...interface{}) { logMessage(DebugLevel, msg, args...) }
+func Info(msg string, args ...interface{})  { logMessage(InfoLevel, msg, args...) }
+func Warn(msg string, args ...interface{})  { logMessage(WarnLevel, msg, args...) }
+func Error(msg string, args ...interface{}) { logMessage(ErrorLevel, msg, args...) }
+func Fatal(msg string, args ...interface{}) { logMessage(ErrorLevel, msg, args...); os.Exit(1) }
