@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# TunnelGate – All‑in‑one installer
+# Usage: sudo ./install.sh              # normal install
+#        sudo ./install.sh --clean      # remove everything EXCEPT certificates
+
 set -euo pipefail
 
 # ---------------------------------------------------------------------
@@ -13,9 +17,10 @@ CERT_DIR="/etc/tunnelgate/certs"
 NGINX_SITE="tunnelgate.conf"
 SERVICE_PREFIX="tunnelgate"
 SYSTEMD_DIR="/etc/systemd/system"
+GO_BIN="/usr/local/go/bin/go"
 
 # ---------------------------------------------------------------------
-# Colors
+# Colors and logging
 # ---------------------------------------------------------------------
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,80 +28,121 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log_info()  { echo -e "${GREEN}[+]${NC} $*"; }
-log_error() { echo -e "${RED}[X]${NC} $*" >&2; }
+log_info()  { echo -e "${GREEN}[+]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*"; }
+log_warn()  { echo -e "${YELLOW}[!]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*"; }
+log_error() { echo -e "${RED}[X]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*" >&2; }
+log_step()  { echo -e "${BLUE}[*]${NC} $(date +'%Y-%m-%d %H:%M:%S') $*"; }
 
 # ---------------------------------------------------------------------
-# Root check
+# Cleanup – preserves certificates
 # ---------------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-    log_error "Must run as root: sudo $0"
-    exit 1
-fi
+cleanup_all() {
+    log_warn "Performing cleanup (certificates in $CERT_DIR will be preserved)..."
 
-# ---------------------------------------------------------------------
-# Cleanup (preserves certs)
-# ---------------------------------------------------------------------
-if [[ $# -gt 0 && "$1" == "--clean" ]]; then
-    log_info "Cleaning up (preserving $CERT_DIR)..."
     for svc in proxy api renew; do
         systemctl stop "${SERVICE_PREFIX}-${svc}.service" 2>/dev/null || true
         systemctl disable "${SERVICE_PREFIX}-${svc}.service" 2>/dev/null || true
     done
     systemctl stop "${SERVICE_PREFIX}-renew.timer" 2>/dev/null || true
     systemctl disable "${SERVICE_PREFIX}-renew.timer" 2>/dev/null || true
+
     rm -f "${SYSTEMD_DIR}/${SERVICE_PREFIX}-"*.service
     rm -f "${SYSTEMD_DIR}/${SERVICE_PREFIX}-"*.timer
     systemctl daemon-reload
+
     rm -f "${BIN_DIR}/tunnelgate"
     rm -rf "$CONFIG_DIR" "$DATA_DIR"
+    log_info "Removed config and data, but preserved $CERT_DIR"
+
     rm -rf "$INSTALL_DIR"
+
     rm -f "/etc/nginx/sites-available/$NGINX_SITE"
     rm -f "/etc/nginx/sites-enabled/$NGINX_SITE"
     systemctl reload nginx 2>/dev/null || true
-    log_info "Cleanup done. Certificates remain in $CERT_DIR"
+
+    log_info "Cleanup completed. Certificates remain in $CERT_DIR."
+    log_info "To also remove certificates, manually delete: rm -rf $CERT_DIR"
+}
+
+trap 'log_error "Installation failed at step: $BASH_COMMAND"; exit 1' ERR
+
+if [[ $# -gt 0 && "$1" == "--clean" ]]; then
+    cleanup_all
     exit 0
 fi
 
-# ---------------------------------------------------------------------
+if [[ $EUID -ne 0 ]]; then
+    log_error "This script must be run as root. Use: sudo $0"
+    exit 1
+fi
+
 # OS detection
-# ---------------------------------------------------------------------
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     OS=$ID
+    VERSION=$VERSION_ID
 else
-    log_error "Unsupported OS"
+    log_error "Unsupported OS – only Debian/Ubuntu are supported."
     exit 1
 fi
 case $OS in
-    debian|ubuntu) ;;
+    debian|ubuntu) log_info "Detected $OS $VERSION" ;;
     *) log_error "Unsupported OS: $OS"; exit 1 ;;
 esac
 
 # ---------------------------------------------------------------------
-# Install packages and Go
+# Install base packages
 # ---------------------------------------------------------------------
-log_info "Installing system packages..."
+log_step "Installing system packages..."
 apt-get update -y
-apt-get install -y curl wget git make nginx-extras certbot dropbear iptables-persistent openssl sqlite3
+apt-get install -y \
+    curl wget git make \
+    nginx-extras certbot python3-certbot-nginx \
+    dropbear iptables iptables-persistent \
+    openssl sqlite3
 
-log_info "Installing Go 1.23..."
+if ! nginx -V 2>&1 | grep -q with-stream; then
+    log_error "Nginx installed without stream module. Please install nginx-extras manually."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# Install Go 1.23
+# ---------------------------------------------------------------------
+log_step "Installing Go 1.23..."
 GO_VERSION="1.23.0"
 GO_ARCH="linux-amd64"
-[[ "$(uname -m)" == "aarch64" ]] && GO_ARCH="linux-arm64"
+if [[ "$(uname -m)" == "aarch64" ]]; then
+    GO_ARCH="linux-arm64"
+fi
+
 cd /tmp
+rm -f "go${GO_VERSION}.${GO_ARCH}.tar.gz"
 wget -q "https://go.dev/dl/go${GO_VERSION}.${GO_ARCH}.tar.gz"
+rm -rf /usr/local/go
 tar -C /usr/local -xzf "go${GO_VERSION}.${GO_ARCH}.tar.gz"
+rm -f "go${GO_VERSION}.${GO_ARCH}.tar.gz"
+
 export PATH="/usr/local/go/bin:$PATH"
-echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
+if ! grep -q "export PATH=/usr/local/go/bin" /etc/profile; then
+    echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
+fi
+
+if ! $GO_BIN version | grep -q "go1.23"; then
+    log_error "Go 1.23 installation failed."
+    exit 1
+fi
+log_info "Go installed: $($GO_BIN version)"
 
 # ---------------------------------------------------------------------
-# Clone repo
+# Clone/update source
 # ---------------------------------------------------------------------
-log_info "Cloning source..."
+log_step "Setting up source code..."
 if [[ -d "$INSTALL_DIR/.git" ]]; then
     cd "$INSTALL_DIR"
-    git fetch origin && git reset --hard origin/main
+    git fetch origin
+    git reset --hard origin/main
+    git clean -f -d
 else
     rm -rf "$INSTALL_DIR"
     git clone "$REPO_URL" "$INSTALL_DIR"
@@ -104,109 +150,299 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Build (go mod tidy and build)
+# Download dependencies and build
 # ---------------------------------------------------------------------
-log_info "Building..."
-go mod download
-go mod tidy
+log_step "Downloading dependencies..."
+$GO_BIN mod download
+$GO_BIN mod tidy
+
+log_step "Building tunnelgate binary..."
 make clean
-make build
+make build GO=$GO_BIN
 
-cp bin/tunnelgate /usr/local/bin/
-chmod +x /usr/local/bin/tunnelgate
+BINARY="$INSTALL_DIR/bin/tunnelgate"
+if [[ ! -f "$BINARY" ]]; then
+    log_error "Build failed – binary not found."
+    exit 1
+fi
+cp "$BINARY" "$BIN_DIR/tunnelgate"
+chmod +x "$BIN_DIR/tunnelgate"
 
 # ---------------------------------------------------------------------
-# Interactive config
+# Validate and collect mandatory inputs
 # ---------------------------------------------------------------------
-log_info "Configuration"
-read -p "Domain: " DOMAIN
-read -p "Email: " EMAIL
-echo "Cert method: 1) HTTP-01  2) DNS-01 Cloudflare  3) Cloudflare Origin"
-read -p "Choice: " CERT_CHOICE
-case $CERT_CHOICE in
-    1) CERT_METHOD="le_http01" ;;
-    2) CERT_METHOD="le_dns_cf"; read -p "CF API Token: " CF_TOKEN ;;
-    3) CERT_METHOD="cf_origin"; read -p "CF Email: " CF_EMAIL; read -p "CF Global Key: " CF_GLOBAL_KEY ;;
-    *) log_error "Invalid"; exit 1 ;;
-esac
-read -p "HTTP ports (comma, e.g., 80,8080): " HTTP_PORTS
-read -p "TLS ports (comma, e.g., 443,8443): " TLS_PORTS
+log_step "Configuration setup"
 
-HTTP_YAML=$(echo "$HTTP_PORTS" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
-TLS_YAML=$(echo "$TLS_PORTS" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
+# Domain – required
+while [[ -z "$DOMAIN" ]]; do
+    read -p "Domain (e.g., tunnel.example.com): " DOMAIN
+    if [[ -z "$DOMAIN" ]]; then
+        log_error "Domain is required. Please enter a valid domain."
+    fi
+done
 
+# Email – required for Let's Encrypt
+while [[ -z "$EMAIL" ]]; do
+    read -p "Email (for Let's Encrypt notifications): " EMAIL
+    if [[ -z "$EMAIL" ]]; then
+        log_error "Email is required for Let's Encrypt. Please enter a valid email."
+    fi
+done
+
+# Certificate method – required, validated
+echo "Choose certificate method:"
+echo "  1) Let's Encrypt HTTP-01 (port 80, standalone)"
+echo "  2) Let's Encrypt DNS-01 via Cloudflare (requires API token)"
+echo "  3) Cloudflare Origin CA (requires email + Global API Key)"
+while true; do
+    read -p "Choice (1/2/3): " CERT_CHOICE
+    case $CERT_CHOICE in
+        1) CERT_METHOD="le_http01"; break ;;
+        2) CERT_METHOD="le_dns_cf"
+           while [[ -z "$CF_TOKEN" ]]; do
+               read -p "Cloudflare API Token: " CF_TOKEN
+               if [[ -z "$CF_TOKEN" ]]; then
+                   log_error "Cloudflare API Token is required for DNS-01 method."
+               fi
+           done
+           break ;;
+        3) CERT_METHOD="cf_origin"
+           while [[ -z "$CF_EMAIL" ]]; do
+               read -p "Cloudflare Account Email: " CF_EMAIL
+               if [[ -z "$CF_EMAIL" ]]; then
+                   log_error "Cloudflare Email is required for Origin CA method."
+               fi
+           done
+           while [[ -z "$CF_GLOBAL_KEY" ]]; do
+               read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY
+               if [[ -z "$CF_GLOBAL_KEY" ]]; then
+                   log_error "Cloudflare Global API Key is required for Origin CA method."
+               fi
+           done
+           break ;;
+        *) log_error "Invalid choice. Please enter 1, 2, or 3." ;;
+    esac
+done
+
+# HTTP ports – required, validate numbers
+while true; do
+    read -p "HTTP ports (comma‑separated, e.g., 80,8080): " HTTP_PORTS_INPUT
+    if [[ -z "$HTTP_PORTS_INPUT" ]]; then
+        log_error "At least one HTTP port is required."
+        continue
+    fi
+    # Validate each port is a number
+    valid=true
+    for p in $(echo "$HTTP_PORTS_INPUT" | tr ',' ' '); do
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" -lt 1 ]] || [[ "$p" -gt 65535 ]]; then
+            log_error "Invalid port: $p. Must be between 1 and 65535."
+            valid=false
+            break
+        fi
+    done
+    if [[ "$valid" == true ]]; then
+        break
+    fi
+done
+
+# TLS ports – required, validate numbers
+while true; do
+    read -p "TLS ports (comma‑separated, e.g., 443,8443): " TLS_PORTS_INPUT
+    if [[ -z "$TLS_PORTS_INPUT" ]]; then
+        log_error "At least one TLS port is required."
+        continue
+    fi
+    valid=true
+    for p in $(echo "$TLS_PORTS_INPUT" | tr ',' ' '); do
+        if ! [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" -lt 1 ]] || [[ "$p" -gt 65535 ]]; then
+            log_error "Invalid port: $p. Must be between 1 and 65535."
+            valid=false
+            break
+        fi
+    done
+    if [[ "$valid" == true ]]; then
+        break
+    fi
+done
+
+# Convert to YAML arrays
+HTTP_PORTS_YAML=$(echo "$HTTP_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
+TLS_PORTS_YAML=$(echo "$TLS_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
+
+# ---------------------------------------------------------------------
+# Create directories and config
+# ---------------------------------------------------------------------
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CERT_DIR"
-cat > "$CONFIG_DIR/config.json" <<EOF
-{
-  "domain": "$DOMAIN",
-  "email": "$EMAIL",
-  "backend_host": "127.0.0.1",
-  "backend_port": 109,
-  "proxy": {"listen_host": "127.0.0.1", "listen_port": 8888, "idle_timeout_seconds": 180, "shared_pass": ""},
-  "api": {"listen_host": "127.0.0.1", "listen_port": 8080, "token": "$(openssl rand -hex 24)"},
-  "nginx": {"http_ports": [$HTTP_YAML], "tls_ports": [$TLS_YAML]},
-  "cert_method": "$CERT_METHOD",
-  "cf_api_token": "${CF_TOKEN:-""}",
-  "cf_email": "${CF_EMAIL:-""}",
-  "cf_global_api_key": "${CF_GLOBAL_KEY:-""}",
-  "database": "$DATA_DIR/users.db",
-  "log_level": "info",
-  "log_format": "text"
-}
+chmod 700 "$CONFIG_DIR" "$DATA_DIR"
+
+if [[ ! -f "$CONFIG_DIR/config.yaml" ]]; then
+    cat > "$CONFIG_DIR/config.yaml" <<EOF
+domain: $DOMAIN
+email: $EMAIL
+
+backend_host: 127.0.0.1
+backend_port: 109
+
+proxy:
+  listen_host: 127.0.0.1
+  listen_port: 8888
+  idle_timeout_seconds: 180
+  shared_pass: ""
+
+api:
+  listen_host: 127.0.0.1
+  listen_port: 8080
+  token: "$(openssl rand -hex 24)"
+
+nginx:
+  http_ports: [$HTTP_PORTS_YAML]
+  tls_ports: [$TLS_PORTS_YAML]
+
+cert_method: $CERT_METHOD
+cf_api_token: ${CF_TOKEN:-""}
+cf_email: ${CF_EMAIL:-""}
+cf_global_api_key: ${CF_GLOBAL_KEY:-""}
+
+database: $DATA_DIR/users.db
+
+log_level: info
+log_format: text
 EOF
-chmod 600 "$CONFIG_DIR/config.json"
+    chmod 600 "$CONFIG_DIR/config.yaml"
+fi
 
 # ---------------------------------------------------------------------
-# Systemd
+# Systemd units
 # ---------------------------------------------------------------------
-log_info "Installing systemd units..."
+log_step "Installing systemd units..."
 cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-proxy.service" <<EOF
 [Unit]
-Description=TunnelGate Proxy
+Description=TunnelGate Proxy Core
 After=network.target
+
 [Service]
-ExecStart=/usr/local/bin/tunnelgate
-Restart=always
+Type=simple
 User=nobody
 Group=nogroup
+ExecStart=/usr/local/bin/tunnelgate start
+Restart=always
+RestartSec=5
+PrivateTmp=true
+NoNewPrivileges=true
+
 [Install]
 WantedBy=multi-user.target
 EOF
+
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-api.service" <<EOF
+[Unit]
+Description=TunnelGate Admin API
+After=network.target
+
+[Service]
+Type=simple
+User=nobody
+Group=nogroup
+ExecStart=/usr/local/bin/tunnelgate api
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-renew.service" <<EOF
+[Unit]
+Description=Renew TLS certificate
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/tunnelgate cert renew
+EOF
+
+cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-renew.timer" <<EOF
+[Unit]
+Description=Daily TLS certificate renewal
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
 systemctl enable ${SERVICE_PREFIX}-proxy.service
+systemctl enable ${SERVICE_PREFIX}-api.service
+systemctl enable ${SERVICE_PREFIX}-renew.timer
 
 # ---------------------------------------------------------------------
-# Nginx and cert
+# Nginx config
 # ---------------------------------------------------------------------
-log_info "Configuring Nginx..."
-tunnelgate nginx configure 2>/dev/null || log_info "Nginx config done manually later"
-tunnelgate cert renew 2>/dev/null || log_info "Cert will be obtained later"
+log_step "Generating Nginx config..."
+tunnelgate nginx configure 2>/dev/null || log_warn "Nginx config generation failed – you may need to run it manually."
 
 # ---------------------------------------------------------------------
-# Firewall
+# Certificate (will reuse if valid)
 # ---------------------------------------------------------------------
-log_info "Firewall..."
+if [[ -n "$DOMAIN" ]]; then
+    log_info "Checking/obtaining certificate for $DOMAIN using $CERT_METHOD..."
+    tunnelgate cert renew || log_warn "Certificate issuance failed – check logs."
+fi
+
+# ---------------------------------------------------------------------
+# Firewall (iptables)
+# ---------------------------------------------------------------------
+log_step "Configuring iptables firewall..."
 iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t mangle -F
+
 iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT ACCEPT
+
 iptables -A INPUT -i lo -j ACCEPT
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-for p in $(echo "$HTTP_PORTS,$TLS_PORTS" | tr ',' ' '); do
+iptables -A INPUT -p tcp --dport 22 -j ACCEPT   # SSH
+
+# Open all HTTP and TLS ports
+for p in $(echo "$HTTP_PORTS_INPUT,$TLS_PORTS_INPUT" | tr ',' ' '); do
     iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
 done
+
 netfilter-persistent save
+log_info "Firewall rules applied and saved."
 
 # ---------------------------------------------------------------------
-# Start
+# Start services
 # ---------------------------------------------------------------------
+log_step "Starting services..."
 systemctl start ${SERVICE_PREFIX}-proxy.service
+systemctl start ${SERVICE_PREFIX}-api.service
+systemctl start ${SERVICE_PREFIX}-renew.timer
 
 # ---------------------------------------------------------------------
-# Done
+# Final message
 # ---------------------------------------------------------------------
 echo ""
-log_info "TunnelGate installed!"
-echo "Domain: $DOMAIN"
-echo "HTTP ports: $HTTP_PORTS"
-echo "TLS ports: $TLS_PORTS"
-echo "Add user: tunnelgate user add <name> --days 30"
+log_info "TunnelGate installation complete!"
+echo ""
+echo "  - Domain:          $DOMAIN"
+echo "  - HTTP ports:      $HTTP_PORTS_INPUT"
+echo "  - TLS ports:       $TLS_PORTS_INPUT"
+echo "  - Admin API:       http://127.0.0.1:8080 (token in $CONFIG_DIR/config.yaml)"
+echo "  - Database:        $DATA_DIR/users.db"
+echo ""
+echo "Next steps:"
+echo "  1. Add a user:    tunnelgate user add <username> --days 30"
+echo "  2. Check status:  tunnelgate status"
+echo "  3. View logs:     journalctl -u ${SERVICE_PREFIX}-proxy -f"
+echo ""
+echo "Configure HTTP Injector with:"
+echo "  - SSH Host:       $DOMAIN"
+echo "  - SSH Port:       (any of the configured ports)"
+echo "  - Username:       <your user>"
+echo "  - Password:       <the one you set>"
+echo "  - Payload:        any HTTP GET with or without Upgrade header."
+echo ""
+echo "To clean everything EXCEPT certificates, run: sudo $0 --clean"
