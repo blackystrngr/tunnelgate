@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# TunnelGate – Smart, Resilient Installer
+# TunnelGate – Ultra‑Robust Installer
 # Usage: sudo ./install.sh [--clean]
 
 set -euo pipefail
@@ -69,25 +69,58 @@ case $OS in
 esac
 
 # =====================================================================
+# PREPARE APT
+# =====================================================================
+log_step "Updating package lists..."
+apt-get update -y
+
+# =====================================================================
 # SMART PACKAGE INSTALL (with retry)
 # =====================================================================
 install_packages() {
     local retries=3
     while (( retries > 0 )); do
-        apt-get update -y && apt-get install -y "$@" && return 0
+        apt-get install -y "$@" && return 0
         log_warn "Package install failed, retrying... ($retries left)"
         (( retries-- ))
         sleep 2
+        apt-get update -y
     done
     return 1
 }
 
-# Ensure essential tools
+# =====================================================================
+# INSTALL ESSENTIAL TOOLS (including psmisc for fuser)
+# =====================================================================
+log_step "Installing essential tools..."
+install_packages curl wget git make || log_warn "Some tools failed to install."
+
+# Ensure fuser is available (from psmisc)
 if ! command -v fuser &>/dev/null; then
     log_info "Installing psmisc (provides fuser)..."
     install_packages psmisc || {
-        log_warn "psmisc install failed, trying with apt-get directly..."
-        apt-get update -y && apt-get install -y psmisc
+        log_warn "psmisc install failed – will use alternative methods to kill ports."
+        # Fallback: define kill_port function that uses lsof or ss
+        kill_port() {
+            local port=$1
+            local pid=$(lsof -ti :$port 2>/dev/null)
+            if [[ -n "$pid" ]]; then
+                kill -9 "$pid" 2>/dev/null && log_info "Killed PID $pid on port $port"
+            fi
+        }
+    }
+fi
+
+# If fuser is now available, use it, otherwise use fallback
+if command -v fuser &>/dev/null; then
+    kill_port() { fuser -k "$1"/tcp 2>/dev/null && log_info "Killed process on port $1"; }
+else
+    kill_port() {
+        local port=$1
+        local pid=$(lsof -ti :$port 2>/dev/null)
+        if [[ -n "$pid" ]]; then
+            kill -9 "$pid" 2>/dev/null && log_info "Killed PID $pid on port $port"
+        fi
     }
 fi
 
@@ -110,14 +143,12 @@ rm -rf /etc/nginx 2>/dev/null || true
 # =====================================================================
 log_step "Killing processes on conflicting ports..."
 for port in 80 443 2053 2083 2087 2096 8443; do
-    if fuser -k "$port"/tcp 2>/dev/null; then
-        log_info "Killed process on port $port"
-    fi
+    kill_port "$port"
 done
 sleep 2
 
 # =====================================================================
-# STEP 3: CLEAN IPTABLES (safe)
+# STEP 3: CLEAN IPTABLES
 # =====================================================================
 log_step "Cleaning iptables rules..."
 iptables-save > /tmp/iptables-backup-$(date +%s).txt 2>/dev/null || true
@@ -130,11 +161,10 @@ iptables -P FORWARD ACCEPT 2>/dev/null || true
 iptables -P OUTPUT ACCEPT 2>/dev/null || true
 
 # =====================================================================
-# STEP 4: INSTALL SYSTEM PACKAGES
+# STEP 4: INSTALL SYSTEM PACKAGES (including nginx-extras)
 # =====================================================================
 log_step "Installing system packages..."
 install_packages \
-    curl wget git make \
     nginx-extras \
     certbot python3-certbot-nginx \
     dropbear \
@@ -143,7 +173,7 @@ install_packages \
     net-tools lsof
 
 if ! nginx -V 2>&1 | grep -q with-stream; then
-    log_error "Nginx stream module missing. Please check nginx-extras."
+    log_error "Nginx stream module missing. Please install nginx-extras manually."
     exit 1
 fi
 
