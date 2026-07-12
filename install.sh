@@ -370,6 +370,7 @@ systemctl enable tunnelgate-proxy tunnelgate-api tunnelgate-renew.timer
 # STEP 12: NGINX (minimal)
 # =====================================================================
 log_step "Configuring Nginx..."
+mkdir -p /etc/nginx  # Ensure directory exists
 cat > /etc/nginx/nginx.conf <<'EOF'
 events { worker_connections 1024; }
 stream { include /etc/nginx/stream.conf; }
