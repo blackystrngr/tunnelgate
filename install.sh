@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# TunnelGate – Fully Automated Installer
-# Usage: sudo ./install.sh
+# TunnelGate – Smart, Resilient Installer
+# Usage: sudo ./install.sh [--clean]
 
 set -euo pipefail
 
@@ -13,40 +13,44 @@ BIN_DIR="/usr/local/bin"
 CONFIG_DIR="/etc/tunnelgate"
 DATA_DIR="/var/lib/tunnelgate"
 CERT_DIR="/etc/tunnelgate/certs"
-NGINX_SITE="tunnelgate.conf"
 SERVICE_PREFIX="tunnelgate"
-SYSTEMD_DIR="/etc/systemd/system"
 
-# Defaults (can be overridden by env)
+# Defaults
 DOMAIN="${DOMAIN:-tunnel.example.com}"
 EMAIL="${EMAIL:-admin@example.com}"
 HTTP_PORTS="${HTTP_PORTS:-80}"
 TLS_PORTS="${TLS_PORTS:-443}"
 CERT_METHOD="${CERT_METHOD:-le_http01}"
-CF_TOKEN="${CF_TOKEN:-}"
-CF_EMAIL="${CF_EMAIL:-}"
-CF_GLOBAL_KEY="${CF_GLOBAL_KEY:-}"
 
 # =====================================================================
-# COLORS & LOGGING
+# COLORS
 # =====================================================================
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 log_info()  { echo -e "${GREEN}[+]${NC} $(date +'%H:%M:%S') $*"; }
 log_warn()  { echo -e "${YELLOW}[!]${NC} $(date +'%H:%M:%S') $*"; }
 log_error() { echo -e "${RED}[X]${NC} $(date +'%H:%M:%S') $*" >&2; }
 log_step()  { echo -e "${BLUE}[*]${NC} $(date +'%H:%M:%S') $*"; }
 
 # =====================================================================
-# ROOT CHECK
+# ROOT CHECK & CLEANUP
 # =====================================================================
 if [[ $EUID -ne 0 ]]; then
     log_error "This script must be run as root. Use: sudo $0"
     exit 1
+fi
+
+if [[ $# -gt 0 && "$1" == "--clean" ]]; then
+    log_warn "Cleaning TunnelGate (certificates preserved)..."
+    systemctl stop tunnelgate-* 2>/dev/null || true
+    systemctl disable tunnelgate-* 2>/dev/null || true
+    rm -f /etc/systemd/system/tunnelgate-*.{service,timer}
+    systemctl daemon-reload
+    rm -f /usr/local/bin/tunnelgate
+    rm -rf /etc/tunnelgate /var/lib/tunnelgate /opt/tunnelgate
+    rm -f /etc/nginx/sites-{available,enabled}/tunnelgate.conf
+    systemctl reload nginx 2>/dev/null || true
+    log_info "Cleanup done. Certificates remain in /etc/tunnelgate/certs."
+    exit 0
 fi
 
 # =====================================================================
@@ -56,7 +60,7 @@ if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     OS=$ID
 else
-    log_error "Cannot detect OS. Only Debian/Ubuntu are supported."
+    log_error "Cannot detect OS."
     exit 1
 fi
 case $OS in
@@ -65,10 +69,32 @@ case $OS in
 esac
 
 # =====================================================================
+# SMART PACKAGE INSTALL (with retry)
+# =====================================================================
+install_packages() {
+    local retries=3
+    while (( retries > 0 )); do
+        apt-get update -y && apt-get install -y "$@" && return 0
+        log_warn "Package install failed, retrying... ($retries left)"
+        (( retries-- ))
+        sleep 2
+    done
+    return 1
+}
+
+# Ensure essential tools
+if ! command -v fuser &>/dev/null; then
+    log_info "Installing psmisc (provides fuser)..."
+    install_packages psmisc || {
+        log_warn "psmisc install failed, trying with apt-get directly..."
+        apt-get update -y && apt-get install -y psmisc
+    }
+fi
+
+# =====================================================================
 # STEP 1: REMOVE CONFLICTING PROGRAMS
 # =====================================================================
 log_step "Removing conflicting web servers..."
-
 for pkg in apache2 lighttpd nginx nginx-common nginx-core nginx-full; do
     if dpkg -l | grep -q "^ii  $pkg "; then
         log_info "Removing $pkg..."
@@ -77,72 +103,47 @@ for pkg in apache2 lighttpd nginx nginx-common nginx-core nginx-full; do
         apt-get remove -y "$pkg" 2>/dev/null || true
     fi
 done
-
-# Clean up any remaining configs
 rm -rf /etc/nginx 2>/dev/null || true
 
 # =====================================================================
-# STEP 2: KILL PROCESSES ON CONFLICTING PORTS
+# STEP 2: KILL PORT PROCESSES
 # =====================================================================
 log_step "Killing processes on conflicting ports..."
-
-# Install psmisc if not present (provides fuser)
-if ! command -v fuser &>/dev/null; then
-    apt-get update -y
-    apt-get install -y psmisc
-fi
-
 for port in 80 443 2053 2083 2087 2096 8443; do
     if fuser -k "$port"/tcp 2>/dev/null; then
         log_info "Killed process on port $port"
     fi
 done
-
-# Wait for sockets to release
 sleep 2
 
 # =====================================================================
-# STEP 3: CLEAN IPTABLES RULES
+# STEP 3: CLEAN IPTABLES (safe)
 # =====================================================================
 log_step "Cleaning iptables rules..."
-
-# Save current rules (just in case)
 iptables-save > /tmp/iptables-backup-$(date +%s).txt 2>/dev/null || true
-
-# Flush all rules
 iptables -F 2>/dev/null || true
 iptables -X 2>/dev/null || true
 iptables -t nat -F 2>/dev/null || true
 iptables -t mangle -F 2>/dev/null || true
-
-# Set default policies
 iptables -P INPUT ACCEPT 2>/dev/null || true
 iptables -P FORWARD ACCEPT 2>/dev/null || true
 iptables -P OUTPUT ACCEPT 2>/dev/null || true
-
-log_info "iptables rules cleared."
 
 # =====================================================================
 # STEP 4: INSTALL SYSTEM PACKAGES
 # =====================================================================
 log_step "Installing system packages..."
-
-apt-get update -y
-
-apt-get install -y \
+install_packages \
     curl wget git make \
     nginx-extras \
     certbot python3-certbot-nginx \
     dropbear \
     iptables iptables-persistent \
     openssl sqlite3 \
-    net-tools \
-    lsof \
-    psmisc
+    net-tools lsof
 
-# Verify Nginx stream module
 if ! nginx -V 2>&1 | grep -q with-stream; then
-    log_error "Nginx installed without stream module. Please check nginx-extras."
+    log_error "Nginx stream module missing. Please check nginx-extras."
     exit 1
 fi
 
@@ -150,24 +151,23 @@ fi
 # STEP 5: INSTALL GO 1.23
 # =====================================================================
 log_step "Installing Go 1.23..."
-
 GO_VERSION="1.23.0"
 GO_ARCH="linux-amd64"
-if [[ "$(uname -m)" == "aarch64" ]]; then
-    GO_ARCH="linux-arm64"
-fi
+[[ "$(uname -m)" == "aarch64" ]] && GO_ARCH="linux-arm64"
 
 cd /tmp
 rm -f "go${GO_VERSION}.${GO_ARCH}.tar.gz"
-wget -q "https://go.dev/dl/go${GO_VERSION}.${GO_ARCH}.tar.gz"
+wget -q "https://go.dev/dl/go${GO_VERSION}.${GO_ARCH}.tar.gz" || {
+    log_error "Go download failed."
+    exit 1
+}
 rm -rf /usr/local/go
 tar -C /usr/local -xzf "go${GO_VERSION}.${GO_ARCH}.tar.gz"
 rm -f "go${GO_VERSION}.${GO_ARCH}.tar.gz"
 
 export PATH="/usr/local/go/bin:$PATH"
-if ! grep -q "export PATH=/usr/local/go/bin" /etc/profile; then
+grep -q "export PATH=/usr/local/go/bin" /etc/profile || \
     echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
-fi
 
 GO_BIN="/usr/local/go/bin/go"
 if ! $GO_BIN version | grep -q "go1.23"; then
@@ -180,7 +180,6 @@ log_info "Go installed: $($GO_BIN version)"
 # STEP 6: CLONE/UPDATE SOURCE
 # =====================================================================
 log_step "Setting up source code..."
-
 if [[ -d "$INSTALL_DIR/.git" ]]; then
     cd "$INSTALL_DIR"
     git fetch origin
@@ -193,153 +192,101 @@ else
 fi
 
 # =====================================================================
-# STEP 7: DOWNLOAD DEPENDENCIES & BUILD
+# STEP 7: BUILD
 # =====================================================================
-log_step "Downloading dependencies and building..."
-
+log_step "Building tunnelgate..."
 $GO_BIN clean -modcache
 $GO_BIN mod download
 $GO_BIN mod tidy
-
 make clean
 make GO=$GO_BIN build
 
 BINARY="$INSTALL_DIR/bin/tunnelgate"
 if [[ ! -f "$BINARY" ]]; then
-    log_error "Build failed – binary not found."
+    log_error "Build failed."
     exit 1
 fi
-
 cp "$BINARY" "$BIN_DIR/tunnelgate"
 chmod +x "$BIN_DIR/tunnelgate"
 
 # =====================================================================
-# STEP 8: PROMPT FOR CONFIG (WITH DEFAULTS)
+# STEP 8: PROMPT (with defaults)
 # =====================================================================
 log_step "Configuration setup"
-
-read -p "Domain [${DOMAIN}]: " input
-DOMAIN="${input:-$DOMAIN}"
-
-read -p "Email [${EMAIL}]: " input
-EMAIL="${input:-$EMAIL}"
-
-read -p "HTTP ports (comma-separated) [${HTTP_PORTS}]: " input
-HTTP_PORTS="${input:-$HTTP_PORTS}"
-
-read -p "TLS ports (comma-separated) [${TLS_PORTS}]: " input
-TLS_PORTS="${input:-$TLS_PORTS}"
-
-echo "Certificate methods:"
-echo "  1) le_http01   - Let's Encrypt HTTP-01 (port 80)"
-echo "  2) le_dns_cf   - Let's Encrypt DNS-01 via Cloudflare"
-echo "  3) cf_origin   - Cloudflare Origin CA"
-echo "  4) selfsigned  - Self-signed (for testing)"
-read -p "Certificate method [${CERT_METHOD}]: " input
-CERT_METHOD="${input:-$CERT_METHOD}"
+read -p "Domain [${DOMAIN}]: " input; DOMAIN="${input:-$DOMAIN}"
+read -p "Email [${EMAIL}]: " input; EMAIL="${input:-$EMAIL}"
+read -p "HTTP ports (comma) [${HTTP_PORTS}]: " input; HTTP_PORTS="${input:-$HTTP_PORTS}"
+read -p "TLS ports (comma) [${TLS_PORTS}]: " input; TLS_PORTS="${input:-$TLS_PORTS}"
+echo "Certificate methods: 1) le_http01  2) le_dns_cf  3) cf_origin  4) selfsigned"
+read -p "Method [${CERT_METHOD}]: " input; CERT_METHOD="${input:-$CERT_METHOD}"
 
 case $CERT_METHOD in
-    le_dns_cf|2)
-        CERT_METHOD="le_dns_cf"
-        read -p "Cloudflare API Token: " CF_TOKEN
-        CF_TOKEN="${CF_TOKEN:-}"
-        ;;
-    cf_origin|3)
-        CERT_METHOD="cf_origin"
-        read -p "Cloudflare Email: " CF_EMAIL
-        CF_EMAIL="${CF_EMAIL:-}"
-        read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY
-        CF_GLOBAL_KEY="${CF_GLOBAL_KEY:-}"
-        ;;
-    selfsigned|4)
-        CERT_METHOD="selfsigned"
-        ;;
-    *)
-        CERT_METHOD="le_http01"
-        ;;
+    le_dns_cf|2) CERT_METHOD="le_dns_cf"; read -p "Cloudflare API Token: " CF_TOKEN; CF_TOKEN="${CF_TOKEN:-}" ;;
+    cf_origin|3) CERT_METHOD="cf_origin"; read -p "Cloudflare Email: " CF_EMAIL; CF_EMAIL="${CF_EMAIL:-}"; read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY; CF_GLOBAL_KEY="${CF_GLOBAL_KEY:-}" ;;
+    selfsigned|4) CERT_METHOD="selfsigned" ;;
+    *) CERT_METHOD="le_http01" ;;
 esac
 
 # =====================================================================
-# STEP 9: CREATE DIRECTORIES AND CONFIG
+# STEP 9: CONFIG & DIRECTORIES
 # =====================================================================
-log_step "Creating directories and config..."
-
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$CERT_DIR"
 chmod 700 "$CONFIG_DIR" "$DATA_DIR"
 
-# Generate API token
 API_TOKEN=$(openssl rand -hex 24)
-
-# Convert ports to YAML arrays
 HTTP_PORTS_YAML=$(echo "$HTTP_PORTS" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
 TLS_PORTS_YAML=$(echo "$TLS_PORTS" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
 
 cat > "$CONFIG_DIR/config.yaml" <<EOF
 domain: $DOMAIN
 email: $EMAIL
-
 backend_host: 127.0.0.1
 backend_port: 109
-
 proxy:
   listen_host: 127.0.0.1
   listen_port: 8888
   idle_timeout_seconds: 180
   shared_pass: ""
-
 api:
   listen_host: 127.0.0.1
   listen_port: 8080
   token: "$API_TOKEN"
-
 nginx:
   http_ports: [$HTTP_PORTS_YAML]
   tls_ports: [$TLS_PORTS_YAML]
-
 cert_method: $CERT_METHOD
 cf_api_token: ${CF_TOKEN:-""}
 cf_email: ${CF_EMAIL:-""}
 cf_global_api_key: ${CF_GLOBAL_KEY:-""}
-
 database: $DATA_DIR/users.db
-
 log_level: info
 log_format: text
 EOF
-
 chmod 600 "$CONFIG_DIR/config.yaml"
 
 # =====================================================================
-# STEP 10: CONFIGURE DROPBEAR
+# STEP 10: DROPBEAR
 # =====================================================================
 log_step "Configuring dropbear..."
-
 cat > /etc/default/dropbear <<'EOF'
 NO_START=0
 DROPBEAR_PORT="127.0.0.1:109"
 DROPBEAR_EXTRA_ARGS="-W 65536"
 DROPBEAR_BANNER=""
 EOF
-
-# Ensure /bin/false is in /etc/shells
-if ! grep -q "/bin/false" /etc/shells 2>/dev/null; then
-    echo "/bin/false" >> /etc/shells
-fi
-
+grep -q "/bin/false" /etc/shells || echo "/bin/false" >> /etc/shells
 systemctl enable dropbear
 systemctl restart dropbear
 
 # =====================================================================
-# STEP 11: SYSTEMD UNITS
+# STEP 11: SYSTEMD
 # =====================================================================
 log_step "Installing systemd units..."
-
-cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-proxy.service" <<'EOF'
+cat > /etc/systemd/system/tunnelgate-proxy.service <<'EOF'
 [Unit]
 Description=TunnelGate Proxy Core
 After=network.target dropbear.service
 Requires=dropbear.service
-
 [Service]
 Type=simple
 User=nobody
@@ -349,16 +296,14 @@ Restart=always
 RestartSec=5
 PrivateTmp=true
 NoNewPrivileges=true
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-api.service" <<'EOF'
+cat > /etc/systemd/system/tunnelgate-api.service <<'EOF'
 [Unit]
 Description=TunnelGate Admin API
 After=network.target
-
 [Service]
 Type=simple
 User=nobody
@@ -366,12 +311,11 @@ Group=nogroup
 ExecStart=/usr/local/bin/tunnelgate api
 Restart=always
 RestartSec=5
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-renew.service" <<'EOF'
+cat > /etc/systemd/system/tunnelgate-renew.service <<'EOF'
 [Unit]
 Description=Renew TLS certificate
 [Service]
@@ -379,7 +323,7 @@ Type=oneshot
 ExecStart=/usr/local/bin/tunnelgate cert renew
 EOF
 
-cat > "$SYSTEMD_DIR/${SERVICE_PREFIX}-renew.timer" <<'EOF'
+cat > /etc/systemd/system/tunnelgate-renew.timer <<'EOF'
 [Unit]
 Description=Daily TLS certificate renewal
 [Timer]
@@ -390,166 +334,83 @@ WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable ${SERVICE_PREFIX}-proxy.service
-systemctl enable ${SERVICE_PREFIX}-api.service
-systemctl enable ${SERVICE_PREFIX}-renew.timer
+systemctl enable tunnelgate-proxy tunnelgate-api tunnelgate-renew.timer
 
 # =====================================================================
-# STEP 12: NGINX CONFIGURATION
+# STEP 12: NGINX (minimal)
 # =====================================================================
 log_step "Configuring Nginx..."
-
-# Create minimal nginx.conf with stream support
 cat > /etc/nginx/nginx.conf <<'EOF'
-events {
-    worker_connections 1024;
-}
-
-stream {
-    include /etc/nginx/stream.conf;
-}
+events { worker_connections 1024; }
+stream { include /etc/nginx/stream.conf; }
 EOF
 
-# Generate stream config from tunnelgate
-tunnelgate nginx configure 2>/dev/null || log_warn "Nginx config generation failed – will use minimal."
-
-# Ensure Nginx can start
-nginx -t 2>/dev/null || {
-    log_warn "Nginx config test failed. Creating minimal stream config..."
+tunnelgate nginx configure 2>/dev/null || {
     cat > /etc/nginx/stream.conf <<EOF
-# Minimal stream config – will be replaced by tunnelgate
+# Minimal config
 EOF
-    nginx -t || log_error "Nginx config still failing."
 }
-
+nginx -t 2>/dev/null || log_warn "Nginx config test failed – continuing anyway."
 systemctl enable nginx
 systemctl restart nginx
 
 # =====================================================================
-# STEP 13: CERTIFICATE (if needed)
+# STEP 13: CERTIFICATE
 # =====================================================================
-if [[ "$CERT_METHOD" != "selfsigned" ]]; then
-    log_step "Obtaining certificate using $CERT_METHOD..."
-    tunnelgate cert renew || log_warn "Certificate issuance failed – you may need to run 'tunnelgate cert renew' manually."
-else
-    log_step "Generating self-signed certificate..."
+if [[ "$CERT_METHOD" == "selfsigned" ]]; then
+    log_step "Generating self‑signed certificate..."
     openssl req -x509 -newkey rsa:2048 -nodes \
-        -keyout "$CERT_DIR/key.pem" \
-        -out "$CERT_DIR/fullchain.pem" \
-        -days 365 \
-        -subj "/CN=$DOMAIN" 2>/dev/null || true
+        -keyout "$CERT_DIR/key.pem" -out "$CERT_DIR/fullchain.pem" \
+        -days 365 -subj "/CN=$DOMAIN" 2>/dev/null || true
+else
+    log_step "Obtaining certificate using $CERT_METHOD..."
+    tunnelgate cert renew || log_warn "Certificate issuance failed – run 'tunnelgate cert renew' later."
 fi
 
 # =====================================================================
-# STEP 14: FIREWALL (IPTABLES)
+# STEP 14: FIREWALL
 # =====================================================================
-log_step "Configuring iptables firewall..."
-
-# Flush everything
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t mangle -F
-
-# Default policies
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
-
-# Loopback
+log_step "Configuring iptables..."
+iptables -F; iptables -X; iptables -t nat -F; iptables -t mangle -F
+iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT ACCEPT
 iptables -A INPUT -i lo -j ACCEPT
-
-# Established connections
 iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-# SSH
 iptables -A INPUT -p tcp --dport 22 -j ACCEPT
-
-# Open all HTTP and TLS ports
 for p in $(echo "$HTTP_PORTS,$TLS_PORTS" | tr ',' ' '); do
     iptables -A INPUT -p tcp --dport "$p" -j ACCEPT
 done
-
-# Save rules (handle both netfilter-persistent and iptables-persistent)
 if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save
-elif command -v iptables-save &>/dev/null; then
+else
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
-    log_info "iptables rules saved to /etc/iptables/rules.v4"
-else
-    log_warn "Could not save iptables rules permanently."
 fi
-
 log_info "Firewall rules applied."
 
 # =====================================================================
 # STEP 15: START SERVICES
 # =====================================================================
 log_step "Starting services..."
-
-systemctl start ${SERVICE_PREFIX}-proxy.service
-systemctl start ${SERVICE_PREFIX}-api.service
-systemctl start ${SERVICE_PREFIX}-renew.timer
+systemctl start tunnelgate-proxy tunnelgate-api tunnelgate-renew.timer
 
 # =====================================================================
 # STEP 16: VERIFICATION
 # =====================================================================
-log_step "Verifying services..."
-
 sleep 2
-
 PROXY_OK=false
-if systemctl is-active --quiet ${SERVICE_PREFIX}-proxy.service; then
-    PROXY_OK=true
-    log_info "✓ Proxy service is running"
-else
-    log_error "✗ Proxy service failed. Check: journalctl -u ${SERVICE_PREFIX}-proxy"
-fi
-
-if systemctl is-active --quiet nginx; then
-    log_info "✓ Nginx is running"
-else
-    log_warn "✗ Nginx is not running. Check: journalctl -u nginx"
-fi
-
-if systemctl is-active --quiet dropbear; then
-    log_info "✓ Dropbear is running on 127.0.0.1:109"
-else
-    log_warn "✗ Dropbear is not running. Check: journalctl -u dropbear"
-fi
+systemctl is-active --quiet tunnelgate-proxy && PROXY_OK=true
 
 # =====================================================================
-# STEP 17: FINAL MESSAGE
+# FINAL MESSAGE
 # =====================================================================
 echo ""
-echo "========================================="
-log_info "TunnelGate INSTALLATION COMPLETE!"
-echo "========================================="
+log_info "TunnelGate installation complete!"
+echo "  Domain:          $DOMAIN"
+echo "  HTTP ports:      $HTTP_PORTS"
+echo "  TLS ports:       $TLS_PORTS"
+echo "  API Token:       $API_TOKEN"
+echo "  Database:        $DATA_DIR/users.db"
+[[ "$PROXY_OK" == "true" ]] && echo "✅ All services running." || echo "⚠️  Proxy failed – check journalctl -u tunnelgate-proxy"
 echo ""
-echo "  - Domain:          $DOMAIN"
-echo "  - HTTP ports:      $HTTP_PORTS"
-echo "  - TLS ports:       $TLS_PORTS"
-echo "  - Admin API:       http://127.0.0.1:8080"
-echo "  - API Token:       $API_TOKEN"
-echo "  - Database:        $DATA_DIR/users.db"
-echo ""
-if [[ "$PROXY_OK" == "true" ]]; then
-    echo "✅ All services are running."
-else
-    echo "⚠️  Some services failed. Check logs above."
-fi
-echo ""
-echo "Next steps:"
-echo "  1. Add a user:    tunnelgate user add <username> --days 30"
-echo "  2. Check status:  tunnelgate status"
-echo "  3. View proxy logs: journalctl -u ${SERVICE_PREFIX}-proxy -f"
-echo ""
-echo "HTTP Injector configuration:"
-echo "  - SSH Host:       $DOMAIN"
-echo "  - SSH Port:       (any HTTP or TLS port)"
-echo "  - Username:       <your user>"
-echo "  - Password:       <the one you set>"
-echo "  - Payload:        any HTTP GET with Upgrade: websocket header"
-echo ""
-echo "To clean everything: sudo $0 --clean"
+echo "Next: tunnelgate user add <username> --days 30"
+echo "Clean: sudo $0 --clean"
