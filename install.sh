@@ -6,21 +6,6 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------
-# Declare all variables with empty defaults (fixes unbound errors)
-# ---------------------------------------------------------------------
-DOMAIN=""
-EMAIL=""
-CERT_CHOICE=""
-CERT_METHOD=""
-CF_TOKEN=""
-CF_EMAIL=""
-CF_GLOBAL_KEY=""
-HTTP_PORTS_INPUT=""
-TLS_PORTS_INPUT=""
-HTTP_PORTS_YAML=""
-TLS_PORTS_YAML=""
-
-# ---------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------
 REPO_URL="https://github.com/blackystrngr/tunnelgate.git"
@@ -196,78 +181,48 @@ cp "$BINARY" "$BIN_DIR/tunnelgate"
 chmod +x "$BIN_DIR/tunnelgate"
 
 # ---------------------------------------------------------------------
-# Now ask for configuration (after successful build)
+# Configuration prompts (with defaults – no mandatory checks)
 # ---------------------------------------------------------------------
 log_step "Configuration setup"
 
-# Mandatory domain
-while [[ -z "$DOMAIN" ]]; do
-    read -p "Domain (e.g., tunnel.example.com): " DOMAIN
-    if [[ -z "$DOMAIN" ]]; then
-        log_error "Domain is required."
-    fi
-done
+# Domain – default: tunnel.example.com
+read -p "Domain (default: tunnel.example.com): " DOMAIN
+DOMAIN="${DOMAIN:-tunnel.example.com}"
 
-# Mandatory email
-while [[ -z "$EMAIL" ]]; do
-    read -p "Email (for Let's Encrypt): " EMAIL
-    if [[ -z "$EMAIL" ]]; then
-        log_error "Email is required."
-    fi
-done
+# Email – default: admin@example.com
+read -p "Email (default: admin@example.com): " EMAIL
+EMAIL="${EMAIL:-admin@example.com}"
 
-echo "Choose certificate method:"
+# Certificate method – default: 1 (le_http01)
+echo "Choose certificate method (default: 1):"
 echo "  1) Let's Encrypt HTTP-01 (port 80, standalone)"
 echo "  2) Let's Encrypt DNS-01 via Cloudflare (requires API token)"
 echo "  3) Cloudflare Origin CA (requires email + Global API Key)"
-while [[ -z "$CERT_CHOICE" ]] || [[ ! "$CERT_CHOICE" =~ ^[1-3]$ ]]; do
-    read -p "Choice (1/2/3): " CERT_CHOICE
-    if [[ ! "$CERT_CHOICE" =~ ^[1-3]$ ]]; then
-        log_error "Invalid choice. Please enter 1, 2, or 3."
-    fi
-done
+read -p "Choice (1/2/3): " CERT_CHOICE
+CERT_CHOICE="${CERT_CHOICE:-1}"
 
 case $CERT_CHOICE in
     1) CERT_METHOD="le_http01" ;;
     2) CERT_METHOD="le_dns_cf"
-       while [[ -z "$CF_TOKEN" ]]; do
-           read -p "Cloudflare API Token: " CF_TOKEN
-           if [[ -z "$CF_TOKEN" ]]; then
-               log_error "Cloudflare API Token is required for DNS-01."
-           fi
-       done
+       read -p "Cloudflare API Token: " CF_TOKEN
+       CF_TOKEN="${CF_TOKEN:-}"
        ;;
     3) CERT_METHOD="cf_origin"
-       while [[ -z "$CF_EMAIL" ]]; do
-           read -p "Cloudflare Email: " CF_EMAIL
-           if [[ -z "$CF_EMAIL" ]]; then
-               log_error "Cloudflare Email is required for Origin CA."
-           fi
-       done
-       while [[ -z "$CF_GLOBAL_KEY" ]]; do
-           read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY
-           if [[ -z "$CF_GLOBAL_KEY" ]]; then
-               log_error "Cloudflare Global API Key is required for Origin CA."
-           fi
-       done
+       read -p "Cloudflare Email: " CF_EMAIL
+       CF_EMAIL="${CF_EMAIL:-}"
+       read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY
+       CF_GLOBAL_KEY="${CF_GLOBAL_KEY:-}"
        ;;
+    *) CERT_METHOD="le_http01" ;;
 esac
 
-# Mandatory HTTP ports
-while [[ -z "$HTTP_PORTS_INPUT" ]]; do
-    read -p "HTTP ports (comma‑separated, e.g., 80,8080): " HTTP_PORTS_INPUT
-    if [[ -z "$HTTP_PORTS_INPUT" ]]; then
-        log_error "At least one HTTP port is required."
-    fi
-done
+# HTTP ports – default: 80
+read -p "HTTP ports (comma‑separated, default: 80): " HTTP_PORTS_INPUT
+HTTP_PORTS_INPUT="${HTTP_PORTS_INPUT:-80}"
 
-# Mandatory TLS ports
-while [[ -z "$TLS_PORTS_INPUT" ]]; do
-    read -p "TLS ports (comma‑separated, e.g., 443,8443): " TLS_PORTS_INPUT
-    if [[ -z "$TLS_PORTS_INPUT" ]]; then
-        log_error "At least one TLS port is required."
-    fi
-done
+# TLS ports – default: 443
+read -p "TLS ports (comma‑separated, default: 443): " TLS_PORTS_INPUT
+TLS_PORTS_INPUT="${TLS_PORTS_INPUT:-443}"
 
 # Convert to YAML arrays
 HTTP_PORTS_YAML=$(echo "$HTTP_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
@@ -387,10 +342,8 @@ tunnelgate nginx configure 2>/dev/null || log_warn "Nginx config generation fail
 # ---------------------------------------------------------------------
 # Certificate (will reuse if valid)
 # ---------------------------------------------------------------------
-if [[ -n "$DOMAIN" ]]; then
-    log_info "Checking/obtaining certificate for $DOMAIN using $CERT_METHOD..."
-    tunnelgate cert renew || log_warn "Certificate issuance failed – check logs."
-fi
+log_info "Checking/obtaining certificate for $DOMAIN using $CERT_METHOD..."
+tunnelgate cert renew || log_warn "Certificate issuance failed – check logs."
 
 # ---------------------------------------------------------------------
 # Firewall (iptables)
