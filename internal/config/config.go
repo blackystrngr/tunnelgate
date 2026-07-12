@@ -1,44 +1,43 @@
 package config
 
 import (
+    "encoding/json"
     "fmt"
     "os"
-
-    "gopkg.in/yaml.v3"
 )
 
 type Config struct {
-    Domain      string `yaml:"domain"`
-    Email       string `yaml:"email"`
-    BackendHost string `yaml:"backend_host"`
-    BackendPort int    `yaml:"backend_port"`
+    Domain      string `json:"domain"`
+    Email       string `json:"email"`
+    BackendHost string `json:"backend_host"`
+    BackendPort int    `json:"backend_port"`
 
     Proxy struct {
-        ListenHost  string `yaml:"listen_host"`
-        ListenPort  int    `yaml:"listen_port"` // unused – we listen on all configured ports
-        IdleTimeout int    `yaml:"idle_timeout_seconds"`
-        SharedPass  string `yaml:"shared_pass"`
-    } `yaml:"proxy"`
+        ListenHost  string `json:"listen_host"`
+        ListenPort  int    `json:"listen_port"`
+        IdleTimeout int    `json:"idle_timeout_seconds"`
+        SharedPass  string `json:"shared_pass"`
+    } `json:"proxy"`
 
     API struct {
-        ListenHost string `yaml:"listen_host"`
-        ListenPort int    `yaml:"listen_port"`
-        Token      string `yaml:"token"`
-    } `yaml:"api"`
+        ListenHost string `json:"listen_host"`
+        ListenPort int    `json:"listen_port"`
+        Token      string `json:"token"`
+    } `json:"api"`
 
     Nginx struct {
-        HTTPPorts []int `yaml:"http_ports"`
-        TLSPorts  []int `yaml:"tls_ports"`
-    } `yaml:"nginx"`
+        HTTPPorts []int `json:"http_ports"`
+        TLSPorts  []int `json:"tls_ports"`
+    } `json:"nginx"`
 
-    CertMethod       string `yaml:"cert_method"`
-    CFAPIToken       string `yaml:"cf_api_token"`
-    CFEmail          string `yaml:"cf_email"`
-    CFGlobalAPIKey   string `yaml:"cf_global_api_key"`
+    CertMethod       string `json:"cert_method"`
+    CFAPIToken       string `json:"cf_api_token"`
+    CFEmail          string `json:"cf_email"`
+    CFGlobalAPIKey   string `json:"cf_global_api_key"`
 
-    Database   string `yaml:"database"`
-    LogLevel   string `yaml:"log_level"`
-    LogFormat  string `yaml:"log_format"`
+    Database   string `json:"database"`
+    LogLevel   string `json:"log_level"`
+    LogFormat  string `json:"log_format"`
 }
 
 func Load(path string) (*Config, error) {
@@ -47,14 +46,14 @@ func Load(path string) (*Config, error) {
         return nil, fmt.Errorf("read config: %w", err)
     }
     var cfg Config
-    if err := yaml.Unmarshal(data, &cfg); err != nil {
+    if err := json.Unmarshal(data, &cfg); err != nil {
         return nil, fmt.Errorf("parse config: %w", err)
     }
     return &cfg, nil
 }
 
 func (c *Config) Save(path string) error {
-    data, err := yaml.Marshal(c)
+    data, err := json.MarshalIndent(c, "", "  ")
     if err != nil {
         return err
     }
@@ -70,31 +69,6 @@ func (c *Config) Validate() error {
     }
     if len(c.Nginx.HTTPPorts) == 0 && len(c.Nginx.TLSPorts) == 0 {
         return fmt.Errorf("at least one HTTP or TLS port must be configured")
-    }
-    for _, p := range c.Nginx.HTTPPorts {
-        if p < 1 || p > 65535 {
-            return fmt.Errorf("invalid HTTP port: %d", p)
-        }
-    }
-    for _, p := range c.Nginx.TLSPorts {
-        if p < 1 || p > 65535 {
-            return fmt.Errorf("invalid TLS port: %d", p)
-        }
-    }
-    validMethods := map[string]bool{
-        "le_http01": true,
-        "le_dns_cf": true,
-        "cf_origin": true,
-        "selfsigned": true,
-    }
-    if !validMethods[c.CertMethod] {
-        return fmt.Errorf("invalid cert_method: %s", c.CertMethod)
-    }
-    if c.CertMethod == "le_dns_cf" && c.CFAPIToken == "" {
-        return fmt.Errorf("cf_api_token required for le_dns_cf")
-    }
-    if c.CertMethod == "cf_origin" && (c.CFEmail == "" || c.CFGlobalAPIKey == "") {
-        return fmt.Errorf("cf_email and cf_global_api_key required for cf_origin")
     }
     return nil
 }
