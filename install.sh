@@ -91,8 +91,65 @@ case $OS in
 esac
 
 # ---------------------------------------------------------------------
-# Interactive input
+# Install dependencies
 # ---------------------------------------------------------------------
+log_step "Installing system packages..."
+apt-get update -y
+apt-get install -y \
+    curl wget git make golang-go \
+    nginx-extras certbot python3-certbot-nginx \
+    dropbear iptables iptables-persistent \
+    openssl sqlite3
+
+if ! nginx -V 2>&1 | grep -q with-stream; then
+    log_error "Nginx installed without stream module. Please install nginx-extras manually."
+    exit 1
+fi
+
+# ---------------------------------------------------------------------
+# Clone/update source (with forced reset)
+# ---------------------------------------------------------------------
+log_step "Setting up source code..."
+if [[ -d "$INSTALL_DIR/.git" ]]; then
+    cd "$INSTALL_DIR"
+    git fetch origin
+    git reset --hard origin/main
+    git clean -f -d
+else
+    rm -rf "$INSTALL_DIR"
+    git clone "$REPO_URL" "$INSTALL_DIR"
+    cd "$INSTALL_DIR"
+fi
+
+# ---------------------------------------------------------------------
+# Clean Go module cache and upgrade sys package
+# ---------------------------------------------------------------------
+log_step "Cleaning Go module cache and updating dependencies..."
+go clean -modcache
+
+# Ensure we have a proper go.mod with correct sys version
+go get -u golang.org/x/sys@v0.20.0
+go mod tidy
+
+# ---------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------
+log_step "Building tunnelgate binary..."
+make clean
+make build
+
+BINARY="$INSTALL_DIR/bin/tunnelgate"
+if [[ ! -f "$BINARY" ]]; then
+    log_error "Build failed – binary not found."
+    exit 1
+fi
+cp "$BINARY" "$BIN_DIR/tunnelgate"
+chmod +x "$BIN_DIR/tunnelgate"
+
+# ---------------------------------------------------------------------
+# Now ask for configuration (after successful build)
+# ---------------------------------------------------------------------
+log_step "Configuration setup"
 read -p "Domain (e.g., tunnel.example.com): " DOMAIN
 read -p "Email (for Let's Encrypt): " EMAIL
 echo "Choose certificate method:"
@@ -116,52 +173,6 @@ read -p "TLS ports (comma‑separated, e.g., 443,8443): " TLS_PORTS_INPUT
 # Convert to YAML arrays
 HTTP_PORTS_YAML=$(echo "$HTTP_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
 TLS_PORTS_YAML=$(echo "$TLS_PORTS_INPUT" | sed 's/,/ /g' | xargs | sed 's/ /, /g')
-
-# ---------------------------------------------------------------------
-# Install dependencies
-# ---------------------------------------------------------------------
-log_step "Installing system packages..."
-apt-get update -y
-apt-get install -y \
-    curl wget git make golang-go \
-    nginx-extras certbot python3-certbot-nginx \
-    dropbear iptables iptables-persistent \
-    openssl sqlite3
-
-if ! nginx -V 2>&1 | grep -q with-stream; then
-    log_error "Nginx installed without stream module. Please install nginx-extras manually."
-    exit 1
-fi
-
-# ---------------------------------------------------------------------
-# Clone/update source (with forced reset)
-# ---------------------------------------------------------------------
-log_step "Setting up source code..."
-if [[ -d "$INSTALL_DIR/.git" ]]; then
-    cd "$INSTALL_DIR"
-    # Discard local changes and pull latest
-    git fetch origin
-    git reset --hard origin/main
-    git clean -f -d
-else
-    rm -rf "$INSTALL_DIR"
-    git clone "$REPO_URL" "$INSTALL_DIR"
-    cd "$INSTALL_DIR"
-fi
-
-# ---------------------------------------------------------------------
-# Build
-# ---------------------------------------------------------------------
-log_step "Building tunnelgate binary..."
-make clean
-make build
-BINARY="$INSTALL_DIR/bin/tunnelgate"
-if [[ ! -f "$BINARY" ]]; then
-    log_error "Build failed – binary not found."
-    exit 1
-fi
-cp "$BINARY" "$BIN_DIR/tunnelgate"
-chmod +x "$BIN_DIR/tunnelgate"
 
 # ---------------------------------------------------------------------
 # Create directories and config
@@ -269,16 +280,14 @@ systemctl enable ${SERVICE_PREFIX}-api.service
 systemctl enable ${SERVICE_PREFIX}-renew.timer
 
 # ---------------------------------------------------------------------
-# Nginx & certificate
+# Nginx config
 # ---------------------------------------------------------------------
-log_step "Configuring Nginx and obtaining certificate..."
-# Generate Nginx config (using the binary)
-if ! tunnelgate nginx --generate-only 2>/dev/null; then
-    # fallback: call the configure function via the binary (if it supports it)
-    tunnelgate nginx configure 2>/dev/null || true
-fi
+log_step "Generating Nginx config..."
+tunnelgate nginx configure 2>/dev/null || log_warn "Nginx config generation failed – you may need to run it manually."
 
-# Obtain certificate (will reuse if valid)
+# ---------------------------------------------------------------------
+# Certificate (will reuse if valid)
+# ---------------------------------------------------------------------
 if [[ -n "$DOMAIN" ]]; then
     log_info "Checking/obtaining certificate for $DOMAIN using $CERT_METHOD..."
     tunnelgate cert renew || log_warn "Certificate issuance failed – check logs."
