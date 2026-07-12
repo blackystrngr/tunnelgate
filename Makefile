@@ -1,8 +1,6 @@
-# TunnelGate Makefile
-
 BINARY_NAME=tunnelgate
 BUILD_DIR=bin
-GO=go
+GO?=go
 
 .PHONY: all build clean test install
 
@@ -21,7 +19,6 @@ clean:
 install: build
 	cp $(BUILD_DIR)/$(BINARY_NAME) /usr/local/bin/
 
-# Cross‑compile for multiple platforms
 release:
 	mkdir -p release
 	GOOS=linux GOARCH=amd64 $(GO) build -ldflags="-s -w" -o release/$(BINARY_NAME)-linux-amd64 ./cmd/$(BINARY_NAME)
