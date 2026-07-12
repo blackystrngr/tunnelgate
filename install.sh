@@ -17,7 +17,6 @@ CERT_DIR="/etc/tunnelgate/certs"
 NGINX_SITE="tunnelgate.conf"
 SERVICE_PREFIX="tunnelgate"
 SYSTEMD_DIR="/etc/systemd/system"
-GO_BIN="/usr/local/go/bin/go"
 
 # ---------------------------------------------------------------------
 # Colors and logging
@@ -66,17 +65,25 @@ cleanup_all() {
 
 trap 'log_error "Installation failed at step: $BASH_COMMAND"; exit 1' ERR
 
+# ---------------------------------------------------------------------
+# Parse arguments
+# ---------------------------------------------------------------------
 if [[ $# -gt 0 && "$1" == "--clean" ]]; then
     cleanup_all
     exit 0
 fi
 
+# ---------------------------------------------------------------------
+# Root check
+# ---------------------------------------------------------------------
 if [[ $EUID -ne 0 ]]; then
     log_error "This script must be run as root. Use: sudo $0"
     exit 1
 fi
 
+# ---------------------------------------------------------------------
 # OS detection
+# ---------------------------------------------------------------------
 if [[ -f /etc/os-release ]]; then
     . /etc/os-release
     OS=$ID
@@ -91,7 +98,7 @@ case $OS in
 esac
 
 # ---------------------------------------------------------------------
-# Install base packages
+# Install base packages (excluding go)
 # ---------------------------------------------------------------------
 log_step "Installing system packages..."
 apt-get update -y
@@ -107,7 +114,7 @@ if ! nginx -V 2>&1 | grep -q with-stream; then
 fi
 
 # ---------------------------------------------------------------------
-# Install Go 1.23
+# Install Go 1.23 from official tarball
 # ---------------------------------------------------------------------
 log_step "Installing Go 1.23..."
 GO_VERSION="1.23.0"
@@ -128,6 +135,7 @@ if ! grep -q "export PATH=/usr/local/go/bin" /etc/profile; then
     echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
 fi
 
+GO_BIN="/usr/local/go/bin/go"
 if ! $GO_BIN version | grep -q "go1.23"; then
     log_error "Go 1.23 installation failed."
     exit 1
@@ -135,7 +143,7 @@ fi
 log_info "Go installed: $($GO_BIN version)"
 
 # ---------------------------------------------------------------------
-# Clone/update source
+# Clone/update source (with forced reset)
 # ---------------------------------------------------------------------
 log_step "Setting up source code..."
 if [[ -d "$INSTALL_DIR/.git" ]]; then
@@ -150,15 +158,19 @@ else
 fi
 
 # ---------------------------------------------------------------------
-# Download dependencies and build
+# Clean and download dependencies
 # ---------------------------------------------------------------------
 log_step "Downloading dependencies..."
+$GO_BIN clean -modcache
 $GO_BIN mod download
 $GO_BIN mod tidy
 
+# ---------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------
 log_step "Building tunnelgate binary..."
 make clean
-make build GO=$GO_BIN
+make GO=$GO_BIN build
 
 BINARY="$INSTALL_DIR/bin/tunnelgate"
 if [[ ! -f "$BINARY" ]]; then
@@ -169,99 +181,87 @@ cp "$BINARY" "$BIN_DIR/tunnelgate"
 chmod +x "$BIN_DIR/tunnelgate"
 
 # ---------------------------------------------------------------------
-# Validate and collect mandatory inputs
+# Now ask for configuration (after successful build)
 # ---------------------------------------------------------------------
 log_step "Configuration setup"
 
-# Domain – required
+# Declare variables with default empty
+DOMAIN=""
+EMAIL=""
+CERT_CHOICE=""
+CERT_METHOD=""
+CF_TOKEN=""
+CF_EMAIL=""
+CF_GLOBAL_KEY=""
+HTTP_PORTS_INPUT=""
+TLS_PORTS_INPUT=""
+
+# Mandatory domain
 while [[ -z "$DOMAIN" ]]; do
     read -p "Domain (e.g., tunnel.example.com): " DOMAIN
     if [[ -z "$DOMAIN" ]]; then
-        log_error "Domain is required. Please enter a valid domain."
+        log_error "Domain is required."
     fi
 done
 
-# Email – required for Let's Encrypt
+# Mandatory email
 while [[ -z "$EMAIL" ]]; do
-    read -p "Email (for Let's Encrypt notifications): " EMAIL
+    read -p "Email (for Let's Encrypt): " EMAIL
     if [[ -z "$EMAIL" ]]; then
-        log_error "Email is required for Let's Encrypt. Please enter a valid email."
+        log_error "Email is required."
     fi
 done
 
-# Certificate method – required, validated
 echo "Choose certificate method:"
 echo "  1) Let's Encrypt HTTP-01 (port 80, standalone)"
 echo "  2) Let's Encrypt DNS-01 via Cloudflare (requires API token)"
 echo "  3) Cloudflare Origin CA (requires email + Global API Key)"
-while true; do
+while [[ -z "$CERT_CHOICE" ]] || [[ ! "$CERT_CHOICE" =~ ^[1-3]$ ]]; do
     read -p "Choice (1/2/3): " CERT_CHOICE
-    case $CERT_CHOICE in
-        1) CERT_METHOD="le_http01"; break ;;
-        2) CERT_METHOD="le_dns_cf"
-           while [[ -z "$CF_TOKEN" ]]; do
-               read -p "Cloudflare API Token: " CF_TOKEN
-               if [[ -z "$CF_TOKEN" ]]; then
-                   log_error "Cloudflare API Token is required for DNS-01 method."
-               fi
-           done
-           break ;;
-        3) CERT_METHOD="cf_origin"
-           while [[ -z "$CF_EMAIL" ]]; do
-               read -p "Cloudflare Account Email: " CF_EMAIL
-               if [[ -z "$CF_EMAIL" ]]; then
-                   log_error "Cloudflare Email is required for Origin CA method."
-               fi
-           done
-           while [[ -z "$CF_GLOBAL_KEY" ]]; do
-               read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY
-               if [[ -z "$CF_GLOBAL_KEY" ]]; then
-                   log_error "Cloudflare Global API Key is required for Origin CA method."
-               fi
-           done
-           break ;;
-        *) log_error "Invalid choice. Please enter 1, 2, or 3." ;;
-    esac
+    if [[ ! "$CERT_CHOICE" =~ ^[1-3]$ ]]; then
+        log_error "Invalid choice. Please enter 1, 2, or 3."
+    fi
 done
 
-# HTTP ports – required, validate numbers
-while true; do
+case $CERT_CHOICE in
+    1) CERT_METHOD="le_http01" ;;
+    2) CERT_METHOD="le_dns_cf"
+       while [[ -z "$CF_TOKEN" ]]; do
+           read -p "Cloudflare API Token: " CF_TOKEN
+           if [[ -z "$CF_TOKEN" ]]; then
+               log_error "Cloudflare API Token is required for DNS-01."
+           fi
+       done
+       ;;
+    3) CERT_METHOD="cf_origin"
+       while [[ -z "$CF_EMAIL" ]]; do
+           read -p "Cloudflare Email: " CF_EMAIL
+           if [[ -z "$CF_EMAIL" ]]; then
+               log_error "Cloudflare Email is required for Origin CA."
+           fi
+       done
+       while [[ -z "$CF_GLOBAL_KEY" ]]; do
+           read -p "Cloudflare Global API Key: " CF_GLOBAL_KEY
+           if [[ -z "$CF_GLOBAL_KEY" ]]; then
+               log_error "Cloudflare Global API Key is required for Origin CA."
+           fi
+       done
+       ;;
+esac
+
+# Mandatory HTTP ports
+while [[ -z "$HTTP_PORTS_INPUT" ]]; do
     read -p "HTTP ports (comma‑separated, e.g., 80,8080): " HTTP_PORTS_INPUT
     if [[ -z "$HTTP_PORTS_INPUT" ]]; then
         log_error "At least one HTTP port is required."
-        continue
-    fi
-    # Validate each port is a number
-    valid=true
-    for p in $(echo "$HTTP_PORTS_INPUT" | tr ',' ' '); do
-        if ! [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" -lt 1 ]] || [[ "$p" -gt 65535 ]]; then
-            log_error "Invalid port: $p. Must be between 1 and 65535."
-            valid=false
-            break
-        fi
-    done
-    if [[ "$valid" == true ]]; then
-        break
     fi
 done
 
-# TLS ports – required, validate numbers
-while true; do
+# Mandatory TLS ports
+while [[ -z "$TLS_PORTS_INPUT" ]]; do
     read -p "TLS ports (comma‑separated, e.g., 443,8443): " TLS_PORTS_INPUT
     if [[ -z "$TLS_PORTS_INPUT" ]]; then
         log_error "At least one TLS port is required."
-        continue
-    fi
-    valid=true
-    for p in $(echo "$TLS_PORTS_INPUT" | tr ',' ' '); do
-        if ! [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" -lt 1 ]] || [[ "$p" -gt 65535 ]]; then
-            log_error "Invalid port: $p. Must be between 1 and 65535."
-            valid=false
-            break
-        fi
-    done
-    if [[ "$valid" == true ]]; then
-        break
     fi
 done
 
